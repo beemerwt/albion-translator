@@ -5,5 +5,6 @@
 __pycache__/
 *.py[cod]
 translator/.venv/
+translator/albion_translator_sidecar.egg-info/
 .agents
 .codex
