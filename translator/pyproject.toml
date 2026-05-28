@@ -1,0 +1,13 @@
+[project]
+name = "albion-translator-sidecar"
+version = "0.1.0"
+description = "Local translation REST sidecar for albion-translator"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+]
+
+[tool.uvicorn]
+host = "127.0.0.1"
+port = 8787

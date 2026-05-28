@@ -1,0 +1,4 @@
+# This is the hosts file for Albion ip addresses
+# Any address listed here will have it's packets processed
+# Addresses are in CIDR format
+5.188.125.0/24
