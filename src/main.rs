@@ -2,24 +2,29 @@ mod cli;
 pub mod translator;
 
 use albion_network_lib::{
-    DecodedPacket, ExtractedPacket, HostFilter, PhotonParser, extract_udp_payload,
+    DecodedPacket, EventCode, ExtractedPacket, HostFilter, OperationCode, PhotonParser,
+    extract_udp_payload, responses::ChatMessage,
 };
 use anyhow::{Context, Result, anyhow};
+use chrono::{DateTime, Local, TimeZone};
 use clap::Parser;
 use cli::Args;
 use pcap::{Active, Capture, Device};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
-    i32, io, mem,
+    borrow::Cow,
+    io, mem,
     path::Path,
     ptr,
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 const CAPTURE_FILTER: &str = "udp port 5056 or udp port 4535";
 const HOSTS_PATH: &str = "hosts.txt";
+const MAX_TRANSLATION_EXPANSION_FACTOR: usize = 4;
+const MIN_TRANSLATION_MAX_CHARS: usize = 120;
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
@@ -28,19 +33,27 @@ fn main() -> Result<()> {
     let host_filter = HostFilter::from_file(Path::new(HOSTS_PATH))
         .map_err(|error| anyhow!(error.0))
         .with_context(|| format!("failed to load CIDR ranges from {HOSTS_PATH}"))?;
-    let _translator_server =
-        translator::TranslatorServer::start().context("failed to start translator sidecar")?;
+    let translator_server = if args.dry_run {
+        None
+    } else {
+        Some(translator::TranslatorServer::start().context("failed to start translator sidecar")?)
+    };
 
-    run_capture(&host_filter, &args)
+    run_capture(&host_filter, &args, translator_server.as_ref())
 }
 
-fn run_capture(host_filter: &HostFilter, args: &Args) -> Result<()> {
+fn run_capture(
+    host_filter: &HostFilter,
+    args: &Args,
+    translator_server: Option<&translator::TranslatorServer>,
+) -> Result<()> {
     install_shutdown_handlers().context("failed to install shutdown signal handlers")?;
 
     let mut captures = open_captures()?;
 
+    let mode = if args.dry_run { "dry run; " } else { "" };
     eprintln!(
-        "capturing on {} interfaces with filter {:?} and {HOSTS_PATH}; press Ctrl-C to stop",
+        "capturing on {} interfaces with filter {:?} and {HOSTS_PATH}; {mode}press Ctrl-C to stop",
         captures.len(),
         CAPTURE_FILTER
     );
@@ -68,6 +81,7 @@ fn run_capture(host_filter: &HostFilter, args: &Args) -> Result<()> {
                         source.link_type,
                         host_filter,
                         args,
+                        translator_server,
                     )
                     .with_context(|| format!("capture source {}", source.name))?;
                 }
@@ -191,14 +205,39 @@ fn is_bluetooth_interface(device: &Device) -> bool {
         || description.contains("bluetooth")
 }
 
+fn debug_output_packet(decoded: &DecodedPacket) -> Result<()> {
+    let should_output = match decoded {
+        DecodedPacket::Event(event) => matches!(
+            event.code,
+            EventCode::JoinedChatChannel
+                | EventCode::LeftChatChannel
+                | EventCode::NewChatChannels
+                | EventCode::RemovedChatChannel
+                | EventCode::ChatMessage
+        ),
+
+        DecodedPacket::Operation(operation) => false,
+        DecodedPacket::Unknown(_) => true,
+    };
+
+    if should_output {
+        let value = serde_json::to_value(decoded).context("failed to serialize decoded packet")?;
+
+        print_json(&value, true)?;
+    }
+
+    Ok(())
+}
+
 fn handle_packet(
     parser: &mut PhotonParser,
     packet_number: usize,
-    timestamp_seconds: libc::time_t,
+    _timestamp_seconds: libc::time_t,
     frame: &[u8],
     link_type: u16,
     host_filter: &HostFilter,
     args: &Args,
+    translator_server: Option<&translator::TranslatorServer>,
 ) -> Result<()> {
     let Some(packet) = extract_udp_payload(frame, Some(link_type)) else {
         return Ok(());
@@ -220,25 +259,32 @@ fn handle_packet(
         .with_context(|| format!("failed to decode packet {packet_number}"))?;
 
     for decoded in &parser.decoded_packets()[before..] {
+        if args.debug {
+            debug_output_packet(decoded)?;
+        }
+
         let DecodedPacket::Event(event) = decoded else {
             continue; // Skip non-event packets when --all is specified
         };
 
         match &event.extracted {
             Some(ExtractedPacket::ChatMessage(message)) => {
-                let timestamp = unix_timestamp(timestamp_seconds)
-                    .context("failed to convert packet timestamp to Unix timestamp")?;
+                // Detect the language of the message and output the translated
+                // if the language was detected as English, just output the message
+                let output = match translator_server {
+                    Some(translator_server) => translate_chat_message(translator_server, message),
+                    None => Cow::Borrowed(message.message.as_str()),
+                };
 
-                let value = json!({
-                    "timestamp": timestamp,
-                    "source": event.source,
-                    "destination": event.destination,
-                    "type": "chat_message",
-                    "message": message,
-                });
-
-                print_json(&value, args.pretty)?;
-            },
+                println!(
+                    "[{}][{}] {}: {}",
+                    millis_to_time_ampm(message.timestamp),
+                    message.channel_type,
+                    message.player_name,
+                    output
+                );
+                // print_json(&value, args.pretty)?;
+            }
             Some(_) => continue,
             None => continue,
         }
@@ -247,13 +293,72 @@ fn handle_packet(
     Ok(())
 }
 
-fn unix_timestamp(seconds: libc::time_t) -> Result<String> {
-    let seconds = u64::try_from(seconds).context("packet timestamp was before Unix epoch")?;
-    let timestamp = UNIX_EPOCH + Duration::from_secs(seconds);
-    let elapsed = timestamp
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .context("packet timestamp was before Unix epoch")?;
-    Ok(elapsed.as_secs().to_string())
+fn translate_chat_message<'a>(
+    translator_server: &translator::TranslatorServer,
+    message: &'a ChatMessage,
+) -> Cow<'a, str> {
+    match translator_server.detect_language(&message.message) {
+        Ok(detected) if detected.language == "en" || detected.language == "unknown" => {
+            Cow::Borrowed(message.message.as_str())
+        }
+        Ok(detected) => {
+            match translator_server.translate_to_english_from(&message.message, &detected.language)
+            {
+                Ok(translated)
+                    if is_usable_translation(&message.message, &translated.translated_text) =>
+                {
+                    Cow::Owned(translated.translated_text)
+                }
+                Ok(translated) => {
+                    eprintln!(
+                        "warning: rejected suspicious {} translation from {} ({} chars -> {} chars)",
+                        detected.language,
+                        message.player_name,
+                        message.message.chars().count(),
+                        translated.translated_text.chars().count()
+                    );
+                    Cow::Borrowed(message.message.as_str())
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: failed to translate {} chat message from {}: {error}",
+                        detected.language, message.player_name
+                    );
+                    Cow::Borrowed(message.message.as_str())
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: failed to detect chat message language from {}: {error}",
+                message.player_name
+            );
+            Cow::Borrowed(message.message.as_str())
+        }
+    }
+}
+
+fn is_usable_translation(original: &str, translated: &str) -> bool {
+    let translated_chars = translated.trim().chars().count();
+    if translated_chars == 0 {
+        return false;
+    }
+
+    let original_chars = original.trim().chars().count().max(1);
+    let max_translated_chars = original_chars
+        .saturating_mul(MAX_TRANSLATION_EXPANSION_FACTOR)
+        .max(MIN_TRANSLATION_MAX_CHARS);
+
+    translated_chars <= max_translated_chars
+}
+
+pub fn millis_to_time_ampm(timestamp_millis: i64) -> String {
+    let dt: DateTime<Local> = Local
+        .timestamp_millis_opt(timestamp_millis)
+        .single()
+        .expect("invalid timestamp millis");
+
+    dt.format("%I:%M %p").to_string()
 }
 
 fn print_json(value: &Value, pretty: bool) -> Result<()> {
@@ -263,4 +368,26 @@ fn print_json(value: &Value, pretty: bool) -> Result<()> {
         println!("{}", serde_json::to_string(value)?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_reasonably_sized_translation() {
+        assert!(is_usable_translation("hola?", "hello?"));
+    }
+
+    #[test]
+    fn rejects_empty_translation() {
+        assert!(!is_usable_translation("hola?", "   "));
+    }
+
+    #[test]
+    fn rejects_runaway_translation_expansion() {
+        let translated = "mainstream".repeat(80);
+
+        assert!(!is_usable_translation("mainstream", &translated));
+    }
 }

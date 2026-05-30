@@ -14,4 +14,8 @@ pub struct Args {
     /// Enable parser debug logging.
     #[arg(long)]
     pub debug: bool,
+
+    /// Print chat without starting the translator sidecar or translating messages.
+    #[arg(long)]
+    pub dry_run: bool,
 }

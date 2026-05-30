@@ -76,7 +76,21 @@ cd translator
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8787
 ```
 
-Current limitation: translation and language detection are stubbed. The REST
-contract is stable, but no real offline ML model is wired in yet. Future backend
-options include LibreTranslate/Argos Translate style backends, NLLB-200 via
-transformers, and OPUS-MT/Helsinki-NLP models.
+Install Argos offline translation packages:
+
+```sh
+cd translator
+. .venv/bin/activate
+python scripts/install_argos_packages.py
+```
+
+Optional Python startup auto-install:
+
+```sh
+ALBION_TRANSLATOR_AUTO_INSTALL=1 cargo run
+```
+
+Argos models are installed outside the Rust build and may not include every
+requested language pair. Vietnamese `vi -> en` may be unavailable depending on
+the Argos package index. Language detection uses `langdetect`; short game/chat
+messages may be unreliable.

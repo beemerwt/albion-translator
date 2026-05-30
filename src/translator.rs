@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     env,
     path::PathBuf,
-    process::{Child, Command},
+    process::{Child, Command, ExitStatus},
     thread,
     time::{Duration, Instant},
 };
 
 const DEFAULT_PORT: u16 = 8787;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
@@ -29,17 +30,53 @@ impl TranslatorServer {
             Some(spawn_python_server(port)?)
         };
 
-        let server = Self { child, client };
+        let mut server = Self { child, client };
         server.wait_for_health()?;
         Ok(server)
     }
 
-    pub fn wait_for_health(&self) -> Result<()> {
-        self.client.wait_for_health()
+    pub fn wait_for_health(&mut self) -> Result<()> {
+        let deadline = Instant::now() + HEALTH_TIMEOUT;
+        let mut last_error = None;
+
+        while Instant::now() < deadline {
+            if let Some(status) = self.child_status()? {
+                return Err(anyhow!(
+                    "translator sidecar exited before becoming healthy: {status}"
+                ));
+            }
+
+            match self.client.health() {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+
+            thread::sleep(HEALTH_POLL_INTERVAL);
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("translator health check timed out")))
+            .context("translator server did not become healthy")
     }
 
     pub fn translate_to_english(&self, text: &str) -> Result<TranslateResponse> {
         self.client.translate_to_english(text)
+    }
+
+    pub fn translate_to_english_from(&self, text: &str, source: &str) -> Result<TranslateResponse> {
+        self.client.translate_to_english_from(text, source)
+    }
+
+    pub fn detect_language(&self, text: &str) -> Result<DetectResponse> {
+        self.client.detect_language(text)
+    }
+
+    fn child_status(&mut self) -> Result<Option<ExitStatus>> {
+        match self.child.as_mut() {
+            Some(child) => child
+                .try_wait()
+                .context("failed to inspect translator child status"),
+            None => Ok(None),
+        }
     }
 }
 
@@ -73,7 +110,7 @@ impl TranslatorClient {
     pub fn new(port: u16) -> Result<Self> {
         Ok(Self {
             http: Client::builder()
-                .timeout(Duration::from_secs(2))
+                .timeout(REQUEST_TIMEOUT)
                 .build()
                 .context("failed to build translator HTTP client")?,
             base_url: base_url(port),
@@ -82,28 +119,13 @@ impl TranslatorClient {
 
     pub fn wait_for_health(&self) -> Result<()> {
         let deadline = Instant::now() + HEALTH_TIMEOUT;
-        let health_url = self.url("/health");
         let mut last_error = None;
 
         while Instant::now() < deadline {
-            match self.http.get(&health_url).send() {
-                Ok(response) if response.status().is_success() => {
-                    let health: HealthResponse = response
-                        .json()
-                        .context("failed to parse translator health response")?;
-                    if health.ok {
-                        return Ok(());
-                    }
-                    last_error = Some(anyhow!("translator health check returned ok=false"));
-                }
-                Ok(response) => {
-                    last_error = Some(anyhow!(
-                        "translator health check returned HTTP {}",
-                        response.status()
-                    ));
-                }
+            match self.health() {
+                Ok(()) => return Ok(()),
                 Err(error) => {
-                    last_error = Some(error.into());
+                    last_error = Some(error);
                 }
             }
 
@@ -114,10 +136,38 @@ impl TranslatorClient {
             .context("translator server did not become healthy")
     }
 
+    fn health(&self) -> Result<()> {
+        let response = self
+            .http
+            .get(self.url("/health"))
+            .send()
+            .context("failed to send translator health request")?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "translator health check returned HTTP {}",
+                response.status()
+            ));
+        }
+
+        let health: HealthResponse = response
+            .json()
+            .context("failed to parse translator health response")?;
+        if health.ok {
+            Ok(())
+        } else {
+            Err(anyhow!("translator health check returned ok=false"))
+        }
+    }
+
     pub fn translate_to_english(&self, text: &str) -> Result<TranslateResponse> {
+        self.translate_to_english_from(text, "auto")
+    }
+
+    pub fn translate_to_english_from(&self, text: &str, source: &str) -> Result<TranslateResponse> {
         let request = TranslateRequest {
             text,
-            source: "auto",
+            source,
             target: "en",
         };
 
@@ -130,6 +180,20 @@ impl TranslatorClient {
             .context("translator returned an error status")?
             .json()
             .context("failed to parse translation response")
+    }
+
+    pub fn detect_language(&self, text: &str) -> Result<DetectResponse> {
+        let request = DetectRequest { text };
+
+        self.http
+            .post(self.url("/detect"))
+            .json(&request)
+            .send()
+            .context("failed to send language detection request")?
+            .error_for_status()
+            .context("translator returned an error status for language detection")?
+            .json()
+            .context("failed to parse language detection response")
     }
 
     fn url(&self, path: &str) -> String {
@@ -150,7 +214,7 @@ pub struct DetectRequest<'a> {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct DetectResponse {
     pub language: String,
-    pub confidence: f64,
+    pub confidence: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -184,6 +248,7 @@ fn use_external_server() -> bool {
 fn spawn_python_server(port: u16) -> Result<Child> {
     let translator_dir = translator_dir()?;
     let python = python_executable(&translator_dir);
+    let argos_home = translator_dir.join(".argos");
 
     Command::new(&python)
         .args([
@@ -196,6 +261,11 @@ fn spawn_python_server(port: u16) -> Result<Child> {
             &port.to_string(),
         ])
         .current_dir(&translator_dir)
+        .env("ARGOS_DEVICE_TYPE", "cpu")
+        .env("XDG_CACHE_HOME", argos_home.join("cache"))
+        .env("XDG_CONFIG_HOME", argos_home.join("config"))
+        .env("XDG_DATA_HOME", argos_home.join("data"))
+        .env("PYTHONUNBUFFERED", "1")
         .spawn()
         .with_context(|| {
             format!(
@@ -209,12 +279,16 @@ fn spawn_python_server(port: u16) -> Result<Child> {
 fn translator_dir() -> Result<PathBuf> {
     let local = PathBuf::from("translator");
     if local.is_dir() {
-        return Ok(local);
+        return local
+            .canonicalize()
+            .context("failed to resolve translator directory");
     }
 
     let manifest_relative = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("translator");
     if manifest_relative.is_dir() {
-        return Ok(manifest_relative);
+        return manifest_relative
+            .canonicalize()
+            .context("failed to resolve translator directory");
     }
 
     Err(anyhow!("translator directory was not found"))
@@ -251,6 +325,16 @@ mod tests {
     }
 
     #[test]
+    fn prefers_venv_python_when_present() {
+        let translator_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("translator");
+        let expected = translator_dir.join(".venv").join("bin").join("python");
+
+        if expected.is_file() {
+            assert_eq!(python_executable(&translator_dir), expected);
+        }
+    }
+
+    #[test]
     fn serializes_translate_request_contract() {
         let request = TranslateRequest {
             text: "hola",
@@ -282,5 +366,34 @@ mod tests {
         assert_eq!(response.source, "es");
         assert_eq!(response.target, "en");
         assert_eq!(response.translated_text, "[stub translation es->en] hola");
+    }
+
+    #[test]
+    #[ignore = "starts the Python translation sidecar and requires sidecar dependencies"]
+    fn starts_sidecar_and_detects_language_over_http() {
+        let server = TranslatorServer::start().unwrap();
+        let response = server.detect_language("hola mundo gracias").unwrap();
+
+        assert!(
+            ["es", "pt", "zh", "vi", "en", "unknown"].contains(&response.language.as_str()),
+            "unexpected detected language: {:?}",
+            response
+        );
+    }
+
+    #[test]
+    #[ignore = "starts the Python translation sidecar and requires an installed es->en Argos package"]
+    fn starts_sidecar_and_translates_spanish_over_http() {
+        let server = TranslatorServer::start().unwrap();
+        let response = server
+            .translate_to_english_from("te gustaria un poco de chocolate", "es")
+            .unwrap();
+
+        assert_eq!(response.source, "es");
+        assert_eq!(response.target, "en");
+        assert!(!response.translated_text.trim().is_empty());
+        assert!(!response.translated_text.contains("mainstre"));
+        assert!(response.translated_text.chars().count() <= 120);
+        assert_eq!(response.translated_text, "You'd like some chocolate.");
     }
 }

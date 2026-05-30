@@ -4,7 +4,10 @@
 *.log
 __pycache__/
 *.py[cod]
+.pytest_cache/
 translator/.venv/
+translator/.argos/
+translator/*.egg-info/
 translator/albion_translator_sidecar.egg-info/
 .agents
 .codex

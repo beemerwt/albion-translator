@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 albion-network-lib = { path = "../albion-network-lib" }
 anyhow = "1.0"
+chrono = "0.4.44"
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 pcap = "2.2"

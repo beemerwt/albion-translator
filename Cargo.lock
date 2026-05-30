@@ -33,6 +33,7 @@ version = "0.1.0"
 dependencies = [
  "albion-network-lib",
  "anyhow",
+ "chrono",
  "clap",
  "libc",
  "pcap",
