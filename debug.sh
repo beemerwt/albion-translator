@@ -3,8 +3,8 @@ set -euo pipefail
 
 export RUST_LOG=1
 export ALBION_NETWORK_DEBUG=1
-export ALBION_TRANSLATOR_PORT=8787
+export TRANSLATION_MODEL_DIR=./models-cache
 
-cargo build
+cargo build --no-default-features --features translation-ct2-cuda
 sudo setcap cap_net_raw,cap_net_admin+ep ./target/debug/albion-translator
-exec ./target/debug/albion-translator --all --pretty "$@"
+exec ./target/debug/albion-translator --pretty "$@"

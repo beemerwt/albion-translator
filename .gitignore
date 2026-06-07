@@ -1,4 +1,15 @@
 /target/
+/dist/
+/models-cache/
+/.venv-models/
+/.cache/huggingface/
+/huggingface-cache/
+models/**/*.bin
+models/**/*.spm
+models/**/*.model
+models/**/*.onnx
+models/**/*.safetensors
+models/**/*.pt
 *.pcap
 *.pcapng
 *.log
@@ -11,3 +22,4 @@ translator/*.egg-info/
 translator/albion_translator_sidecar.egg-info/
 .agents
 .codex
+.envrc

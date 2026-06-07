@@ -1,9 +1,10 @@
 mod cli;
+pub mod translation;
 pub mod translator;
 
 use albion_network_lib::{
-    DecodedPacket, EventCode, ExtractedPacket, HostFilter, OperationCode, PhotonParser,
-    extract_udp_payload, responses::ChatMessage,
+    ChatMessage, DecodedPacket, EventCode, ExtractedPacket, HostFilter, PhotonParser,
+    PhotonParserConfig, extract_udp_payload,
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local, TimeZone};
@@ -58,7 +59,8 @@ fn run_capture(
         CAPTURE_FILTER
     );
 
-    let mut parser = PhotonParser::new("live".to_string(), args.debug);
+    let config = PhotonParserConfig::with_defaults("live".to_string(), args.debug);
+    let mut parser = PhotonParser::new(config);
     let mut packet_number = 0usize;
 
     while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
@@ -252,11 +254,10 @@ fn handle_packet(
         .receive_packet(
             packet.payload,
             packet_number,
-            &packet.source.to_string(),
-            &packet.destination.to_string(),
+            packet.source,
+            packet.destination,
         )
-        .map_err(|error| anyhow!(error.0))
-        .with_context(|| format!("failed to decode packet {packet_number}"))?;
+        .ok();
 
     for decoded in &parser.decoded_packets()[before..] {
         if args.debug {

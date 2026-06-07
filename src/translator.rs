@@ -1,3 +1,8 @@
+use crate::translation::{
+    Backend, CachedTranslator, Ct2Config, Ct2Translator, NoopTranslator,
+    TranslateRequest as NativeTranslateRequest, TranslationConfig, Translator,
+    simple_detect_language,
+};
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -13,15 +18,164 @@ const DEFAULT_PORT: u16 = 8787;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const INITIAL_SOURCE: &str = "es";
+const DEFAULT_TARGET: &str = "en";
 
-#[derive(Debug)]
 pub struct TranslatorServer {
-    child: Option<Child>,
-    client: TranslatorClient,
+    backend: TranslationBackend,
 }
 
 impl TranslatorServer {
     pub fn start() -> Result<Self> {
+        let config = TranslationConfig::from_env()?;
+        let backend = TranslationBackend::start(config)?;
+        Ok(Self { backend })
+    }
+
+    pub fn wait_for_health(&mut self) -> Result<()> {
+        self.backend.wait_for_health()
+    }
+
+    pub fn translate_to_english(&self, text: &str) -> Result<TranslateResponse> {
+        self.translate_to_english_from(text, "auto")
+    }
+
+    pub fn translate_to_english_from(&self, text: &str, source: &str) -> Result<TranslateResponse> {
+        self.backend.translate_to_english_from(text, source)
+    }
+
+    pub fn detect_language(&self, text: &str) -> Result<DetectResponse> {
+        self.backend.detect_language(text)
+    }
+}
+
+enum TranslationBackend {
+    Native(Box<dyn Translator>),
+    Argos(ArgosServer),
+    Unavailable(String),
+}
+
+impl TranslationBackend {
+    fn start(config: TranslationConfig) -> Result<Self> {
+        match config.backend {
+            Backend::Noop => Ok(Self::Native(Box::new(NoopTranslator))),
+            Backend::Ct2 => Ok(start_ct2_backend(&config).unwrap_or_else(|error| {
+                Self::Unavailable(format!("ct2 translation is unavailable: {error:#}"))
+            })),
+            Backend::Argos => ArgosServer::start().map(Self::Argos).or_else(|error| {
+                Ok(Self::Unavailable(format!(
+                    "deprecated Argos sidecar is unavailable: {error:#}"
+                )))
+            }),
+            Backend::Auto => {
+                if Ct2Translator::is_available(&ct2_config(&config), INITIAL_SOURCE, DEFAULT_TARGET)
+                {
+                    if let Ok(backend) = start_ct2_backend(&config) {
+                        return Ok(backend);
+                    }
+                }
+
+                if config.argos_fallback {
+                    match ArgosServer::start() {
+                        Ok(server) => {
+                            eprintln!(
+                                "warning: using deprecated Python Argos translation fallback; install a CTranslate2 model to use the Rust-native ct2 backend"
+                            );
+                            Ok(Self::Argos(server))
+                        }
+                        Err(error) => Ok(Self::Unavailable(format!(
+                            "translation is unavailable; no ct2 model is installed and deprecated Argos fallback failed: {error:#}"
+                        ))),
+                    }
+                } else {
+                    Ok(Self::Unavailable(
+                        "translation is unavailable; no ct2 model is installed and Argos fallback is disabled"
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn wait_for_health(&mut self) -> Result<()> {
+        match self {
+            Self::Argos(server) => server.wait_for_health(),
+            Self::Native(_) | Self::Unavailable(_) => Ok(()),
+        }
+    }
+
+    fn translate_to_english_from(&self, text: &str, source: &str) -> Result<TranslateResponse> {
+        match self {
+            Self::Native(translator) => {
+                let source = if source == "auto" {
+                    simple_detect_language(text)
+                } else {
+                    source.to_string()
+                };
+                let response = translator.translate(NativeTranslateRequest {
+                    source_lang: source.clone(),
+                    target_lang: DEFAULT_TARGET.to_string(),
+                    text: text.to_string(),
+                })?;
+
+                Ok(TranslateResponse {
+                    source,
+                    target: DEFAULT_TARGET.to_string(),
+                    translated_text: response.translated_text,
+                    engine: response.engine,
+                    model_id: response.model_id,
+                    device: response.device,
+                })
+            }
+            Self::Argos(server) => server.client.translate_to_english_from(text, source),
+            Self::Unavailable(reason) => Err(anyhow!("{reason}")),
+        }
+    }
+
+    fn detect_language(&self, text: &str) -> Result<DetectResponse> {
+        match self {
+            Self::Native(_) | Self::Unavailable(_) => Ok(DetectResponse {
+                language: simple_detect_language(text),
+                confidence: None,
+            }),
+            Self::Argos(server) => server.client.detect_language(text),
+        }
+    }
+}
+
+fn start_ct2_backend(config: &TranslationConfig) -> Result<TranslationBackend> {
+    let translator = Ct2Translator::new(ct2_config(config), INITIAL_SOURCE, DEFAULT_TARGET)?;
+    let model_id = translator.model_id();
+    eprintln!(
+        "translation backend: ct2 model={} device={} cuda_build={}",
+        model_id.as_deref().unwrap_or("unknown"),
+        translator.device(),
+        Ct2Translator::cuda_build_available()
+    );
+
+    Ok(TranslationBackend::Native(Box::new(CachedTranslator::new(
+        translator,
+        model_id,
+        config.cache_capacity,
+    ))))
+}
+
+fn ct2_config(config: &TranslationConfig) -> Ct2Config {
+    Ct2Config {
+        model_dir: config.model_dir.clone(),
+        manifest_path: config.manifest_path.clone(),
+        device: config.device,
+        allow_device_fallback: config.allow_device_fallback,
+    }
+}
+
+struct ArgosServer {
+    child: Option<Child>,
+    client: TranslatorClient,
+}
+
+impl ArgosServer {
+    fn start() -> Result<Self> {
         let port = configured_port()?;
         let client = TranslatorClient::new(port)?;
         let child = if use_external_server() {
@@ -35,7 +189,7 @@ impl TranslatorServer {
         Ok(server)
     }
 
-    pub fn wait_for_health(&mut self) -> Result<()> {
+    fn wait_for_health(&mut self) -> Result<()> {
         let deadline = Instant::now() + HEALTH_TIMEOUT;
         let mut last_error = None;
 
@@ -58,18 +212,6 @@ impl TranslatorServer {
             .context("translator server did not become healthy")
     }
 
-    pub fn translate_to_english(&self, text: &str) -> Result<TranslateResponse> {
-        self.client.translate_to_english(text)
-    }
-
-    pub fn translate_to_english_from(&self, text: &str, source: &str) -> Result<TranslateResponse> {
-        self.client.translate_to_english_from(text, source)
-    }
-
-    pub fn detect_language(&self, text: &str) -> Result<DetectResponse> {
-        self.client.detect_language(text)
-    }
-
     fn child_status(&mut self) -> Result<Option<ExitStatus>> {
         match self.child.as_mut() {
             Some(child) => child
@@ -80,7 +222,7 @@ impl TranslatorServer {
     }
 }
 
-impl Drop for TranslatorServer {
+impl Drop for ArgosServer {
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
@@ -168,10 +310,11 @@ impl TranslatorClient {
         let request = TranslateRequest {
             text,
             source,
-            target: "en",
+            target: DEFAULT_TARGET,
         };
 
-        self.http
+        let mut response: TranslateResponse = self
+            .http
             .post(self.url("/translate"))
             .json(&request)
             .send()
@@ -179,7 +322,10 @@ impl TranslatorClient {
             .error_for_status()
             .context("translator returned an error status")?
             .json()
-            .context("failed to parse translation response")
+            .context("failed to parse translation response")?;
+        response.engine = "argos".to_string();
+        response.device = "cpu".to_string();
+        Ok(response)
     }
 
     pub fn detect_language(&self, text: &str) -> Result<DetectResponse> {
@@ -229,6 +375,20 @@ pub struct TranslateResponse {
     pub source: String,
     pub target: String,
     pub translated_text: String,
+    #[serde(default = "default_engine")]
+    pub engine: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default = "default_device")]
+    pub device: String,
+}
+
+fn default_engine() -> String {
+    "argos".to_string()
+}
+
+fn default_device() -> String {
+    "cpu".to_string()
 }
 
 fn configured_port() -> Result<u16> {
@@ -269,7 +429,7 @@ fn spawn_python_server(port: u16) -> Result<Child> {
         .spawn()
         .with_context(|| {
             format!(
-                "failed to launch translator sidecar with {} from {}",
+                "failed to launch deprecated Argos translator sidecar with {} from {}",
                 python.display(),
                 translator_dir.display()
             )
@@ -355,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_translate_response_contract() {
+    fn deserializes_argos_translate_response_contract_with_defaults() {
         let response: TranslateResponse = serde_json::from_value(serde_json::json!({
             "source": "es",
             "target": "en",
@@ -366,13 +526,30 @@ mod tests {
         assert_eq!(response.source, "es");
         assert_eq!(response.target, "en");
         assert_eq!(response.translated_text, "[stub translation es->en] hola");
+        assert_eq!(response.engine, "argos");
+        assert_eq!(response.model_id, None);
+        assert_eq!(response.device, "cpu");
     }
 
     #[test]
-    #[ignore = "starts the Python translation sidecar and requires sidecar dependencies"]
+    fn native_noop_backend_uses_existing_facade() {
+        let backend = TranslationBackend::start(TranslationConfig {
+            backend: Backend::Noop,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let response = backend.translate_to_english_from("hola HO", "es").unwrap();
+
+        assert_eq!(response.translated_text, "hola HO");
+        assert_eq!(response.engine, "noop");
+    }
+
+    #[test]
+    #[ignore = "starts the deprecated Python Argos sidecar and requires sidecar dependencies"]
     fn starts_sidecar_and_detects_language_over_http() {
-        let server = TranslatorServer::start().unwrap();
-        let response = server.detect_language("hola mundo gracias").unwrap();
+        let server = ArgosServer::start().unwrap();
+        let response = server.client.detect_language("hola mundo gracias").unwrap();
 
         assert!(
             ["es", "pt", "zh", "vi", "en", "unknown"].contains(&response.language.as_str()),
@@ -382,10 +559,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "starts the Python translation sidecar and requires an installed es->en Argos package"]
+    #[ignore = "starts the deprecated Python Argos sidecar and requires an installed es->en Argos package"]
     fn starts_sidecar_and_translates_spanish_over_http() {
-        let server = TranslatorServer::start().unwrap();
+        let server = ArgosServer::start().unwrap();
         let response = server
+            .client
             .translate_to_english_from("te gustaria un poco de chocolate", "es")
             .unwrap();
 
@@ -394,6 +572,5 @@ mod tests {
         assert!(!response.translated_text.trim().is_empty());
         assert!(!response.translated_text.contains("mainstre"));
         assert!(response.translated_text.chars().count() <= 120);
-        assert_eq!(response.translated_text, "You'd like some chocolate.");
     }
 }

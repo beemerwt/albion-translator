@@ -3,11 +3,17 @@ name = "albion-translator"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["translation-ct2-cpu"]
+translation-ct2-cpu = ["dep:ct2rs"]
+translation-ct2-cuda = ["dep:ct2rs", "ct2rs/cuda"]
+
 [dependencies]
 albion-network-lib = { path = "../albion-network-lib" }
 anyhow = "1.0"
 chrono = "0.4.44"
 clap = { version = "4.5", features = ["derive"] }
+ct2rs = { version = "0.9.19", optional = true, default-features = false, features = ["sentencepiece", "tokenizers", "ruy"] }
 libc = "0.2"
 pcap = "2.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

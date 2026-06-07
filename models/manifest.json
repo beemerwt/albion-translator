@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "opus-mt-es-en-ct2",
+      "version": "2026-06-07",
+      "source": "es",
+      "target": "en",
+      "hf_model": "Helsinki-NLP/opus-mt-es-en",
+      "path": "opus-mt-es-en-int8",
+      "quantization": "int8",
+      "model_type": "marian",
+      "copy_files": [
+        "source.spm",
+        "target.spm",
+        "tokenizer_config.json"
+      ],
+      "tokenizer": {
+        "source": "source.spm",
+        "target": "target.spm",
+        "tokenizer_json": null
+      },
+      "archive": null
+    }
+  ]
+}
