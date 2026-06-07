@@ -21,6 +21,39 @@
         "tokenizer_json": null
       },
       "archive": null
+    },
+    {
+      "id": "quickmt-pt-en-ct2",
+      "version": "2026-06-07",
+      "source": "pt",
+      "target": "en",
+      "hf_model": "quickmt/quickmt-pt-en",
+      "path": "quickmt-pt-en",
+      "quantization": null,
+      "model_type": "quickmt_ct2",
+      "format": "ctranslate2",
+      "preconverted": true,
+      "copy_files": [
+        "config.json",
+        "model.bin",
+        "source_vocabulary.json",
+        "target_vocabulary.json",
+        "src.spm.model",
+        "tgt.spm.model"
+      ],
+      "tokenizer": {
+        "type": "sentencepiece",
+        "source": "src.spm.model",
+        "target": "tgt.spm.model"
+      },
+      "ignore_patterns": [
+        "eole-model/*",
+        ".ipynb_checkpoints/*",
+        ".gitattributes",
+        "README.md",
+        "eole-config.yaml"
+      ],
+      "archive": null
     }
   ]
 }

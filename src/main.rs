@@ -218,7 +218,7 @@ fn debug_output_packet(decoded: &DecodedPacket) -> Result<()> {
                 | EventCode::ChatMessage
         ),
 
-        DecodedPacket::Operation(operation) => false,
+        DecodedPacket::Operation(_) => false,
         DecodedPacket::Unknown(_) => true,
     };
 
@@ -298,15 +298,18 @@ fn translate_chat_message<'a>(
     translator_server: &translator::TranslatorServer,
     message: &'a ChatMessage,
 ) -> Cow<'a, str> {
-    match translator_server.detect_language(&message.message) {
+    // Cleanse message to not include symbols that might cause translation to fail
+    let clean_message = clean_message(&message.message);
+
+    match translator_server.detect_language(clean_message.as_str()) {
         Ok(detected) if detected.language == "en" || detected.language == "unknown" => {
             Cow::Borrowed(message.message.as_str())
         }
         Ok(detected) => {
-            match translator_server.translate_to_english_from(&message.message, &detected.language)
+            match translator_server.translate_to_english_from(clean_message.as_str(), &detected.language)
             {
                 Ok(translated)
-                    if is_usable_translation(&message.message, &translated.translated_text) =>
+                    if is_usable_translation(clean_message.as_str(), &translated.translated_text) =>
                 {
                     Cow::Owned(translated.translated_text)
                 }
@@ -370,6 +373,15 @@ fn print_json(value: &Value, pretty: bool) -> Result<()> {
     }
     Ok(())
 }
+
+fn clean_message(message: &str) -> String {
+    // keep only a-zA-Z0-9, spaces, exclamation marks, question marks, periods, commas, and apostrophes
+    message
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace() || *c == '!' || *c == '?')
+        .collect()
+}
+
 
 #[cfg(test)]
 mod tests {

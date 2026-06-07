@@ -207,7 +207,32 @@ def require_tools() -> None:
         fail("missing ct2-transformers-converter CLI; install the ctranslate2 Python package")
 
 
-def build_converted_command(
+def verify_sentencepiece_tokenizer(path: Path) -> None:
+    paired_candidates = [
+        ("source.spm", "target.spm"),
+        ("src.spm.model", "tgt.spm.model"),
+    ]
+
+    single_candidates = [
+        "spm.model",
+        "sentencepiece.model",
+        "sentencepiece.bpe.model",
+        "tokenizer.model",
+    ]
+
+    if any((path / src).is_file() and (path / tgt).is_file() for src, tgt in paired_candidates):
+        return
+
+    if any((path / name).is_file() for name in single_candidates):
+        return
+
+    fail(
+        f"{path} does not contain a recognized SentencePiece tokenizer file; "
+        "expected source/target pair or one shared tokenizer model"
+    )
+
+
+def build_converter_command(
     model_path: str,
     prepared_dir: Path,
     quantization: str,
@@ -227,6 +252,72 @@ def build_converted_command(
         command.extend(["--copy_files", *copy_files])
 
     return command
+
+
+def prepare_preconverted_ct2_model(
+    model: dict[str, Any],
+    prepared_dir: Path,
+    force: bool,
+    dry_run: bool,
+) -> None:
+    hf_model = model.get("hf_model")
+    if not hf_model:
+        fail(f"model {model['id']} is missing 'hf_model'")
+
+    copy_files = [str(path) for path in model.get("copy_files", []) if path]
+
+    if not copy_files:
+        fail(f"preconverted model {model['id']} must declare copy_files")
+
+    if prepared_dir.exists() and force:
+        if dry_run:
+            print(f"would remove existing prepared model directory {prepared_dir}")
+        else:
+            shutil.rmtree(prepared_dir)
+
+    if dry_run:
+        print(f"would download preconverted CTranslate2 model {hf_model}")
+        for file in copy_files:
+            print(f"would copy {file} -> {prepared_dir / file}")
+        return
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        fail(
+            "missing Python package huggingface_hub. "
+            "Install with: pip install huggingface_hub"
+        )
+
+    snapshot_dir = Path(snapshot_download(repo_id=str(hf_model)))
+
+    prepared_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    if prepared_dir.exists():
+        shutil.rmtree(prepared_dir)
+
+    prepared_dir.mkdir(parents=True)
+
+    missing = []
+    for relative in copy_files:
+        source = snapshot_dir / relative
+        destination = prepared_dir / relative
+
+        if not source.is_file():
+            missing.append(relative)
+            continue
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+    if missing:
+        fail(
+            f"preconverted model {model['id']} is missing expected files: "
+            + ", ".join(missing)
+        )
+
+    verify_ct2_model(prepared_dir)
+    verify_sentencepiece_tokenizer(prepared_dir)
 
 
 def prepare_model(
@@ -261,6 +352,10 @@ def prepare_model(
     require_tools()
     snapshot_dir = download_hf_snapshot(str(hf_model), dry_run)
     copy_files = existing_copy_files(snapshot_dir, raw_copy_files)
+
+    if model.get("preconverted") is True or model.get("format") == "ctranslate2":
+        prepare_preconverted_ct2_model(model, prepared_dir, force, dry_run)
+        return
 
     command = build_converter_command(
         model_path=str(snapshot_dir),
@@ -311,16 +406,21 @@ def write_bundled_manifest(
     print(f"wrote bundled manifest to {path}")
 
 
-def prepared_model_dir_name(model: dict[str, Any], quantization: str) -> str:
+def prepared_model_dir_name(model: dict[str, Any], quantization: str | None) -> str:
     manifest_path = model.get("path")
-    if isinstance(manifest_path, str) and manifest_path and model.get("quantization", quantization) == quantization:
+    if isinstance(manifest_path, str) and manifest_path:
         return manifest_path
 
     base = str(model.get("hf_model") or model.get("id") or f"{model['source']}-{model['target']}")
     slug = base.split("/")[-1].lower().replace("_", "-")
+
     if slug.endswith("-ct2"):
         slug = slug[:-4]
-    return f"{slug}-{quantization}"
+
+    if model.get("preconverted") is True or model.get("format") == "ctranslate2":
+        return slug
+
+    return f"{slug}-{quantization or model.get('quantization') or 'int8'}"
 
 
 def looks_like_ct2_model(path: Path) -> bool:
