@@ -22,5 +22,6 @@ translator/*.egg-info/
 translator/albion_translator_sidecar.egg-info/
 .agents
 .codex
-.envrc
+.env
+translations.sqlite3
 /vendor/

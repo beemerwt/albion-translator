@@ -62,6 +62,16 @@ impl ModelStore {
             model.id
         ))
     }
+
+    pub fn has_installed_model_for_target(&self, target: &str) -> bool {
+        self.manifest.models.iter().any(|model| {
+            model.target == target
+                && self.search_roots.iter().any(|root| {
+                    let path = root.join(&model.path);
+                    is_valid_ct2_model_dir(&path)
+                })
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

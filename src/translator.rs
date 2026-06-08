@@ -1,7 +1,7 @@
 use crate::translation::{
-    Backend, CachedTranslator, Ct2Config, Ct2Translator, NoopTranslator,
-    TranslateRequest as NativeTranslateRequest, TranslationConfig, Translator,
-    simple_detect_language,
+    Backend, Ct2Config, LanguageDetection, LanguageDetector, LinguaLanguageDetector,
+    SourceLanguageConfig, TranslationCache, TranslationConfig, TranslationOutcome,
+    TranslationRouter,
 };
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
@@ -18,18 +18,25 @@ const DEFAULT_PORT: u16 = 8787;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const INITIAL_SOURCE: &str = "es";
 const DEFAULT_TARGET: &str = "en";
 
 pub struct TranslatorServer {
     backend: TranslationBackend,
+    cache: TranslationCache,
+    target_lang: String,
 }
 
 impl TranslatorServer {
     pub fn start() -> Result<Self> {
         let config = TranslationConfig::from_env()?;
+        let cache = TranslationCache::open(&config.cache_db_path)?;
+        let target_lang = config.target_lang.clone();
         let backend = TranslationBackend::start(config)?;
-        Ok(Self { backend })
+        Ok(Self {
+            backend,
+            cache,
+            target_lang,
+        })
     }
 
     pub fn wait_for_health(&mut self) -> Result<()> {
@@ -41,7 +48,15 @@ impl TranslatorServer {
     }
 
     pub fn translate_to_english_from(&self, text: &str, source: &str) -> Result<TranslateResponse> {
-        self.backend.translate_to_english_from(text, source)
+        if let Some(cached) = self.cache.lookup_google(text, &self.target_lang)? {
+            return Ok(cached);
+        }
+
+        let response = self.backend.translate_to_english_from(text, source)?;
+        if response.engine == "google" {
+            self.cache.insert_google(text, &response)?;
+        }
+        Ok(response)
     }
 
     pub fn detect_language(&self, text: &str) -> Result<DetectResponse> {
@@ -50,28 +65,67 @@ impl TranslatorServer {
 }
 
 enum TranslationBackend {
-    Native(Box<dyn Translator>),
-    Argos(ArgosServer),
+    Native(Box<TranslationRouter>),
+    Argos {
+        server: ArgosServer,
+        source_lang: SourceLanguageConfig,
+        target_lang: String,
+    },
+    Google {
+        client: GoogleTranslateClient,
+        detector: LinguaLanguageDetector,
+        target_lang: String,
+        confidence_threshold: f64,
+    },
+    Noop {
+        source_lang: SourceLanguageConfig,
+        target_lang: String,
+    },
+    #[cfg(test)]
+    Counting {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        response: TranslateResponse,
+    },
     Unavailable(String),
 }
 
 impl TranslationBackend {
     fn start(config: TranslationConfig) -> Result<Self> {
         match config.backend {
-            Backend::Noop => Ok(Self::Native(Box::new(NoopTranslator))),
-            Backend::Ct2 => Ok(start_ct2_backend(&config).unwrap_or_else(|error| {
+            Backend::Noop => Ok(Self::Noop {
+                source_lang: config.source_lang,
+                target_lang: config.target_lang,
+            }),
+            Backend::Ct2 => Ok(start_native_router(&config).unwrap_or_else(|error| {
                 Self::Unavailable(format!("ct2 translation is unavailable: {error:#}"))
             })),
-            Backend::Argos => ArgosServer::start().map(Self::Argos).or_else(|error| {
-                Ok(Self::Unavailable(format!(
-                    "deprecated Argos sidecar is unavailable: {error:#}"
-                )))
+            Backend::Argos => ArgosServer::start()
+                .map(|server| Self::Argos {
+                    server,
+                    source_lang: config.source_lang,
+                    target_lang: config.target_lang,
+                })
+                .or_else(|error| {
+                    Ok(Self::Unavailable(format!(
+                        "deprecated Argos sidecar is unavailable: {error:#}"
+                    )))
+                }),
+            Backend::Google => Ok(Self::Google {
+                client: GoogleTranslateClient::from_env()?,
+                detector: LinguaLanguageDetector::default(),
+                target_lang: config.target_lang,
+                confidence_threshold: config.detection_confidence_threshold,
             }),
             Backend::Auto => {
-                if Ct2Translator::is_available(&ct2_config(&config), INITIAL_SOURCE, DEFAULT_TARGET)
-                {
-                    if let Ok(backend) = start_ct2_backend(&config) {
-                        return Ok(backend);
+                match start_native_router(&config) {
+                    Ok(Self::Native(router)) if router.has_installed_model_for_target() => {
+                        return Ok(Self::Native(router));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "warning: native ct2 translation router is unavailable: {error:#}"
+                        );
                     }
                 }
 
@@ -81,7 +135,11 @@ impl TranslationBackend {
                             eprintln!(
                                 "warning: using deprecated Python Argos translation fallback; install a CTranslate2 model to use the Rust-native ct2 backend"
                             );
-                            Ok(Self::Argos(server))
+                            Ok(Self::Argos {
+                                server,
+                                source_lang: config.source_lang,
+                                target_lang: config.target_lang,
+                            })
                         }
                         Err(error) => Ok(Self::Unavailable(format!(
                             "translation is unavailable; no ct2 model is installed and deprecated Argos fallback failed: {error:#}"
@@ -99,65 +157,134 @@ impl TranslationBackend {
 
     fn wait_for_health(&mut self) -> Result<()> {
         match self {
-            Self::Argos(server) => server.wait_for_health(),
-            Self::Native(_) | Self::Unavailable(_) => Ok(()),
+            Self::Argos { server, .. } => server.wait_for_health(),
+            Self::Native(_) | Self::Google { .. } | Self::Noop { .. } | Self::Unavailable(_) => {
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::Counting { .. } => Ok(()),
         }
     }
 
     fn translate_to_english_from(&self, text: &str, source: &str) -> Result<TranslateResponse> {
         match self {
-            Self::Native(translator) => {
-                let source = if source == "auto" {
-                    simple_detect_language(text)
-                } else {
-                    source.to_string()
-                };
-                let response = translator.translate(NativeTranslateRequest {
-                    source_lang: source.clone(),
-                    target_lang: DEFAULT_TARGET.to_string(),
-                    text: text.to_string(),
-                })?;
-
-                Ok(TranslateResponse {
-                    source,
-                    target: DEFAULT_TARGET.to_string(),
+            Self::Native(router) => match router.translate_with_source(text, source)? {
+                TranslationOutcome::Translated {
+                    response,
+                    source_lang,
+                    target_lang,
+                } => Ok(TranslateResponse {
+                    source: response
+                        .detected_language
+                        .clone()
+                        .unwrap_or_else(|| source_lang.clone()),
+                    target: target_lang,
                     translated_text: response.translated_text,
                     engine: response.engine,
                     model_id: response.model_id,
                     device: response.device,
-                })
+                    detected_language: response.detected_language.or(Some(source_lang)),
+                    from_cache: response.from_cache,
+                }),
+                TranslationOutcome::Skipped {
+                    source_lang,
+                    target_lang,
+                    ..
+                } => Ok(TranslateResponse {
+                    source: source_lang.clone(),
+                    target: target_lang,
+                    translated_text: text.to_string(),
+                    engine: "skipped".to_string(),
+                    model_id: None,
+                    device: "none".to_string(),
+                    detected_language: Some(source_lang),
+                    from_cache: false,
+                }),
+            },
+            Self::Argos {
+                server,
+                source_lang,
+                target_lang,
+            } => {
+                server
+                    .client
+                    .translate(text, &source_for_request(source, source_lang), target_lang)
             }
-            Self::Argos(server) => server.client.translate_to_english_from(text, source),
+            Self::Google {
+                client,
+                detector,
+                target_lang,
+                confidence_threshold,
+            } => {
+                let detection = detect_locally_for_routing(detector, text)?;
+                if let Some(response) = skip_from_local_detection(
+                    text,
+                    target_lang,
+                    confidence_threshold,
+                    detection.as_ref(),
+                ) {
+                    return Ok(response);
+                }
+
+                let local_detected_language = detection
+                    .as_ref()
+                    .map(|detection| detection.language.as_str());
+                let mut response = client.translate(text, target_lang)?;
+                apply_google_language_fallback(&mut response, local_detected_language);
+                Ok(response)
+            }
+            Self::Noop {
+                source_lang,
+                target_lang,
+            } => Ok(TranslateResponse {
+                source: source_for_request(source, source_lang),
+                target: target_lang.clone(),
+                translated_text: text.to_string(),
+                engine: "noop".to_string(),
+                model_id: None,
+                device: "none".to_string(),
+                detected_language: Some(source_for_request(source, source_lang)),
+                from_cache: false,
+            }),
+            #[cfg(test)]
+            Self::Counting { calls, response } => {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(response.clone())
+            }
             Self::Unavailable(reason) => Err(anyhow!("{reason}")),
         }
     }
 
     fn detect_language(&self, text: &str) -> Result<DetectResponse> {
         match self {
-            Self::Native(_) | Self::Unavailable(_) => Ok(DetectResponse {
-                language: simple_detect_language(text),
-                confidence: None,
-            }),
-            Self::Argos(server) => server.client.detect_language(text),
+            Self::Native(router) => detect_response(router.detect_language(text)?),
+            Self::Google { detector, .. } => detect_response(detector.detect(text)?),
+            Self::Noop { .. } | Self::Unavailable(_) => {
+                detect_response(LinguaLanguageDetector::default().detect(text)?)
+            }
+            #[cfg(test)]
+            Self::Counting { .. } => {
+                detect_response(LinguaLanguageDetector::default().detect(text)?)
+            }
+            Self::Argos { server, .. } => server.client.detect_language(text),
         }
     }
 }
 
-fn start_ct2_backend(config: &TranslationConfig) -> Result<TranslationBackend> {
-    let translator = Ct2Translator::new(ct2_config(config), INITIAL_SOURCE, DEFAULT_TARGET)?;
-    let model_id = translator.model_id();
+fn start_native_router(config: &TranslationConfig) -> Result<TranslationBackend> {
+    let router = TranslationRouter::new_ct2(
+        ct2_config(config),
+        config.source_lang.clone(),
+        config.target_lang.clone(),
+        config.detection_confidence_threshold,
+        config.cache_capacity,
+    )?;
     eprintln!(
-        "translation backend: ct2 model={} device={} cuda_build={}",
-        model_id.as_deref().unwrap_or("unknown"),
-        translator.device(),
-        Ct2Translator::cuda_build_available()
+        "translation backend: ct2 router target={} source={:?}",
+        config.target_lang, config.source_lang
     );
 
-    Ok(TranslationBackend::Native(Box::new(CachedTranslator::new(
-        translator,
-        model_id,
-        config.cache_capacity,
-    ))))
+    Ok(TranslationBackend::Native(Box::new(router)))
 }
 
 fn ct2_config(config: &TranslationConfig) -> Ct2Config {
@@ -167,6 +294,220 @@ fn ct2_config(config: &TranslationConfig) -> Ct2Config {
         device: config.device,
         allow_device_fallback: config.allow_device_fallback,
     }
+}
+
+fn detect_response(detection: LanguageDetection) -> Result<DetectResponse> {
+    Ok(DetectResponse {
+        language: detection.language,
+        confidence: detection.confidence,
+    })
+}
+
+fn detect_locally_for_routing(
+    detector: &LinguaLanguageDetector,
+    text: &str,
+) -> Result<Option<LanguageDetection>> {
+    if skip_without_detection(text).is_some() {
+        return Ok(None);
+    }
+
+    Ok(Some(detector.detect(text)?))
+}
+
+fn skip_from_local_detection(
+    text: &str,
+    target_lang: &str,
+    confidence_threshold: &f64,
+    detection: Option<&LanguageDetection>,
+) -> Option<TranslateResponse> {
+    if skip_without_detection(text).is_some() {
+        return Some(skipped_response(text, "unknown", target_lang));
+    }
+
+    let detection = detection?;
+    let detected_language = detection.language.as_str();
+    let confidence = detection.confidence.unwrap_or(0.0);
+    if detected_language == "unknown" || confidence < *confidence_threshold {
+        return Some(skipped_response(text, detected_language, target_lang));
+    }
+
+    if detected_language == target_lang {
+        return Some(skipped_response(text, detected_language, target_lang));
+    }
+
+    None
+}
+
+fn skipped_response(text: &str, source: &str, target: &str) -> TranslateResponse {
+    TranslateResponse {
+        source: source.to_string(),
+        target: target.to_string(),
+        translated_text: text.to_string(),
+        engine: "skipped".to_string(),
+        model_id: None,
+        device: "none".to_string(),
+        detected_language: Some(source.to_string()),
+        from_cache: false,
+    }
+}
+
+fn apply_google_language_fallback(
+    response: &mut TranslateResponse,
+    local_detected_language: Option<&str>,
+) {
+    if response.detected_language.is_none() {
+        response.detected_language = local_detected_language.map(str::to_string);
+    }
+    if response.source == "unknown" {
+        response.source = response
+            .detected_language
+            .clone()
+            .or_else(|| local_detected_language.map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+    }
+}
+
+fn skip_without_detection(text: &str) -> Option<()> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || contains_url(trimmed) {
+        return Some(());
+    }
+
+    let alphabetic_count = trimmed
+        .chars()
+        .filter(|character| character.is_alphabetic())
+        .count();
+    if alphabetic_count < 4 { Some(()) } else { None }
+}
+
+fn contains_url(text: &str) -> bool {
+    text.split_whitespace().any(|token| {
+        let token = token.to_ascii_lowercase();
+        token.starts_with("http://")
+            || token.starts_with("https://")
+            || token.starts_with("www.")
+            || token.contains("://")
+    })
+}
+
+fn source_for_request(source: &str, config_source: &SourceLanguageConfig) -> String {
+    if source != "auto" {
+        return source.to_string();
+    }
+
+    match config_source {
+        SourceLanguageConfig::Auto => "auto".to_string(),
+        SourceLanguageConfig::Manual(language) => language.clone(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GoogleTranslateClient {
+    http: Client,
+    api_key: String,
+    endpoint: String,
+}
+
+impl GoogleTranslateClient {
+    fn from_env() -> Result<Self> {
+        let api_key = read_google_api_key()?;
+        let endpoint = env::var("GOOGLE_TRANSLATE_ENDPOINT").unwrap_or_else(|_| {
+            "https://translation.googleapis.com/language/translate/v2".to_string()
+        });
+
+        Ok(Self {
+            http: Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .context("failed to build Google Translate HTTP client")?,
+            api_key,
+            endpoint,
+        })
+    }
+
+    fn translate(&self, text: &str, target: &str) -> Result<TranslateResponse> {
+        let request = GoogleTranslateRequest {
+            q: text,
+            target,
+            format: "text",
+        };
+
+        let response: GoogleTranslateResponse = self
+            .http
+            .post(&self.endpoint)
+            .query(&[("key", self.api_key.as_str())])
+            .json(&request)
+            .send()
+            .context("failed to send Google Translate request")?
+            .error_for_status()
+            .context("Google Translate returned an error status")?
+            .json()
+            .context("failed to parse Google Translate response")?;
+
+        let translation = response
+            .data
+            .translations
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Google Translate returned no translation"))?;
+        let detected_language = translation.detected_source_language;
+        let source = detected_language
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Ok(TranslateResponse {
+            source,
+            target: target.to_string(),
+            translated_text: decode_google_text(&translation.translated_text),
+            engine: "google".to_string(),
+            model_id: None,
+            device: "remote".to_string(),
+            detected_language,
+            from_cache: false,
+        })
+    }
+}
+
+fn read_google_api_key() -> Result<String> {
+    match env::var("GOOGLE_TRANSLATE_API_KEY").or_else(|_| env::var("TRANSLATION_GOOGLE_API_KEY")) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(_) | Err(_) => Err(anyhow!(
+            "Google Translate requires GOOGLE_TRANSLATE_API_KEY or TRANSLATION_GOOGLE_API_KEY"
+        )),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct GoogleTranslateRequest<'a> {
+    q: &'a str,
+    target: &'a str,
+    format: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTranslateResponse {
+    data: GoogleTranslateData,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTranslateData {
+    translations: Vec<GoogleTranslation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleTranslation {
+    #[serde(rename = "translatedText")]
+    translated_text: String,
+    #[serde(rename = "detectedSourceLanguage")]
+    detected_source_language: Option<String>,
+}
+
+fn decode_google_text(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }
 
 struct ArgosServer {
@@ -307,10 +648,14 @@ impl TranslatorClient {
     }
 
     pub fn translate_to_english_from(&self, text: &str, source: &str) -> Result<TranslateResponse> {
+        self.translate(text, source, DEFAULT_TARGET)
+    }
+
+    pub fn translate(&self, text: &str, source: &str, target: &str) -> Result<TranslateResponse> {
         let request = TranslateRequest {
             text,
             source,
-            target: DEFAULT_TARGET,
+            target,
         };
 
         let mut response: TranslateResponse = self
@@ -325,6 +670,8 @@ impl TranslatorClient {
             .context("failed to parse translation response")?;
         response.engine = "argos".to_string();
         response.device = "cpu".to_string();
+        response.detected_language = Some(response.source.clone());
+        response.from_cache = false;
         Ok(response)
     }
 
@@ -370,7 +717,7 @@ pub struct TranslateRequest<'a> {
     pub target: &'a str,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TranslateResponse {
     pub source: String,
     pub target: String,
@@ -381,6 +728,10 @@ pub struct TranslateResponse {
     pub model_id: Option<String>,
     #[serde(default = "default_device")]
     pub device: String,
+    #[serde(default)]
+    pub detected_language: Option<String>,
+    #[serde(default)]
+    pub from_cache: bool,
 }
 
 fn default_engine() -> String {
@@ -470,6 +821,10 @@ fn base_url(port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn builds_localhost_base_url() {
@@ -529,6 +884,8 @@ mod tests {
         assert_eq!(response.engine, "argos");
         assert_eq!(response.model_id, None);
         assert_eq!(response.device, "cpu");
+        assert_eq!(response.detected_language, None);
+        assert!(!response.from_cache);
     }
 
     #[test]
@@ -543,6 +900,86 @@ mod tests {
 
         assert_eq!(response.translated_text, "hola HO");
         assert_eq!(response.engine, "noop");
+    }
+
+    fn google_response(text: &str, detected_language: Option<&str>) -> TranslateResponse {
+        TranslateResponse {
+            source: detected_language.unwrap_or("unknown").to_string(),
+            target: "en".to_string(),
+            translated_text: text.to_string(),
+            engine: "google".to_string(),
+            model_id: None,
+            device: "remote".to_string(),
+            detected_language: detected_language.map(str::to_string),
+            from_cache: false,
+        }
+    }
+
+    #[test]
+    fn cache_hit_avoids_backend_call() {
+        let cache = TranslationCache::in_memory().unwrap();
+        cache
+            .insert_google(
+                " hola   amigo ",
+                &google_response("hello friend", Some("es")),
+            )
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = TranslatorServer {
+            backend: TranslationBackend::Counting {
+                calls: calls.clone(),
+                response: google_response("should not be used", Some("es")),
+            },
+            cache,
+            target_lang: "en".to_string(),
+        };
+
+        let response = server.translate_to_english("hola amigo").unwrap();
+
+        assert_eq!(response.translated_text, "hello friend");
+        assert!(response.from_cache);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cache_miss_calls_backend_and_inserts_google_result() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = TranslatorServer {
+            backend: TranslationBackend::Counting {
+                calls: calls.clone(),
+                response: google_response("hello friend", Some("es")),
+            },
+            cache: TranslationCache::in_memory().unwrap(),
+            target_lang: "en".to_string(),
+        };
+
+        let first = server.translate_to_english("hola amigo").unwrap();
+        let second = server.translate_to_english(" hola   amigo ").unwrap();
+
+        assert!(!first.from_cache);
+        assert!(second.from_cache);
+        assert_eq!(second.translated_text, "hello friend");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn google_detected_language_overrides_local_detection() {
+        let mut response = google_response("hello friend", Some("es"));
+
+        apply_google_language_fallback(&mut response, Some("pt"));
+
+        assert_eq!(response.source, "es");
+        assert_eq!(response.detected_language.as_deref(), Some("es"));
+    }
+
+    #[test]
+    fn google_result_falls_back_to_lingua_detection_when_missing() {
+        let mut response = google_response("hello friend", None);
+
+        apply_google_language_fallback(&mut response, Some("pt"));
+
+        assert_eq!(response.source, "pt");
+        assert_eq!(response.detected_language.as_deref(), Some("pt"));
     }
 
     #[test]

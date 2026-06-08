@@ -1,14 +1,26 @@
+pub mod cache;
 pub mod ct2;
 pub mod glossary;
+pub mod language_detector;
 pub mod model_store;
+pub mod router;
 pub mod translator;
 
 use anyhow::{Result, anyhow};
 use std::{env, path::PathBuf, str::FromStr};
 
+pub use cache::{CachedTranslation, TranslationCache};
 pub use ct2::{Ct2Config, Ct2Translator};
 pub use glossary::Glossary;
+pub use language_detector::{
+    LanguageDetection, LanguageDetector, LinguaLanguageDetector, ManualLanguageDetector,
+    NoopLanguageDetector,
+};
 pub use model_store::{ModelManifest, ModelStore, TranslationModel};
+pub use router::{
+    Ct2TranslatorFactory, SourceLanguageConfig, TranslationOutcome, TranslationRouter,
+    TranslationSkipReason,
+};
 pub use translator::{
     CacheKey, CachedTranslator, NoopTranslator, TranslateRequest, TranslateResponse, Translator,
 };
@@ -18,6 +30,7 @@ pub enum Backend {
     Auto,
     Ct2,
     Argos,
+    Google,
     Noop,
 }
 
@@ -27,6 +40,7 @@ impl Backend {
             Self::Auto => "auto",
             Self::Ct2 => "ct2",
             Self::Argos => "argos",
+            Self::Google => "google",
             Self::Noop => "noop",
         }
     }
@@ -40,9 +54,10 @@ impl FromStr for Backend {
             "" | "auto" => Ok(Self::Auto),
             "ct2" | "ctranslate2" => Ok(Self::Ct2),
             "argos" => Ok(Self::Argos),
+            "google" | "google-translate" | "google_translate" => Ok(Self::Google),
             "noop" | "none" => Ok(Self::Noop),
             other => Err(anyhow!(
-                "unsupported translation backend {other:?}; expected auto, ct2, argos, or noop"
+                "unsupported translation backend {other:?}; expected auto, ct2, argos, google, or noop"
             )),
         }
     }
@@ -85,9 +100,13 @@ pub struct TranslationConfig {
     pub backend: Backend,
     pub device: TranslationDevice,
     pub allow_device_fallback: bool,
+    pub source_lang: SourceLanguageConfig,
+    pub target_lang: String,
+    pub detection_confidence_threshold: f64,
     pub model_dir: Option<PathBuf>,
     pub manifest_path: Option<PathBuf>,
     pub cache_capacity: usize,
+    pub cache_db_path: PathBuf,
     pub argos_fallback: bool,
 }
 
@@ -97,9 +116,13 @@ impl Default for TranslationConfig {
             backend: Backend::Auto,
             device: TranslationDevice::Auto,
             allow_device_fallback: false,
+            source_lang: SourceLanguageConfig::Auto,
+            target_lang: "en".to_string(),
+            detection_confidence_threshold: 0.65,
             model_dir: None,
             manifest_path: None,
             cache_capacity: 256,
+            cache_db_path: PathBuf::from("translations.sqlite3"),
             argos_fallback: true,
         }
     }
@@ -117,6 +140,27 @@ impl TranslationConfig {
 
         if let Some(value) = read_env("TRANSLATION_DEVICE")? {
             config.device = value.parse()?;
+        }
+
+        if let Some(value) = read_env("TRANSLATION_SOURCE_LANG")? {
+            config.source_lang = value.parse()?;
+        }
+
+        if let Some(value) = read_env("TRANSLATION_TARGET_LANG")? {
+            config.target_lang = parse_target_lang(&value)?;
+        }
+
+        if let Some(value) = read_env("TRANSLATION_DETECTION_CONFIDENCE_THRESHOLD")? {
+            config.detection_confidence_threshold = value.parse().map_err(|error| {
+                anyhow!(
+                    "invalid TRANSLATION_DETECTION_CONFIDENCE_THRESHOLD value {value:?}: {error}"
+                )
+            })?;
+            if !(0.0..=1.0).contains(&config.detection_confidence_threshold) {
+                return Err(anyhow!(
+                    "TRANSLATION_DETECTION_CONFIDENCE_THRESHOLD must be between 0.0 and 1.0"
+                ));
+            }
         }
 
         if let Some(value) = read_env("TRANSLATION_MODEL_DIR")? {
@@ -137,6 +181,12 @@ impl TranslationConfig {
             })?;
         }
 
+        if let Some(value) = read_env("TRANSLATION_CACHE_DB")? {
+            config.cache_db_path = PathBuf::from(value);
+        } else if let Some(value) = read_env("ALBION_TRANSLATION_CACHE_DB")? {
+            config.cache_db_path = PathBuf::from(value);
+        }
+
         if let Some(value) = read_env("TRANSLATION_ALLOW_DEVICE_FALLBACK")? {
             config.allow_device_fallback = parse_bool(&value)?;
         }
@@ -147,6 +197,19 @@ impl TranslationConfig {
 
         Ok(config)
     }
+}
+
+fn parse_target_lang(value: &str) -> Result<String> {
+    let normalized = normalize_lang(value);
+    if normalized.is_empty() {
+        Err(anyhow!("TRANSLATION_TARGET_LANG cannot be empty"))
+    } else {
+        Ok(normalized)
+    }
+}
+
+pub(crate) fn normalize_lang(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('_', "-")
 }
 
 fn read_env(name: &str) -> Result<Option<String>> {
@@ -165,45 +228,6 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
-pub fn simple_detect_language(text: &str) -> String {
-    let normalized = text.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        return "unknown".to_string();
-    }
-
-    let spanish_markers = [
-        " el ",
-        " la ",
-        " los ",
-        " las ",
-        " que ",
-        " para ",
-        " por ",
-        " gracias ",
-        " hola ",
-        " necesito ",
-        " vamos ",
-        " esta ",
-        " donde ",
-        " porque ",
-        " si ",
-        " no ",
-    ];
-    let padded = format!(" {normalized} ");
-
-    if text.contains('¿')
-        || text.contains('¡')
-        || normalized.contains('ñ')
-        || spanish_markers.iter().any(|marker| padded.contains(marker))
-    {
-        "es".to_string()
-    } else if normalized.is_ascii() {
-        "en".to_string()
-    } else {
-        "unknown".to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,11 +236,20 @@ mod tests {
     fn parses_backend_names() {
         assert_eq!("ct2".parse::<Backend>().unwrap(), Backend::Ct2);
         assert_eq!("ctranslate2".parse::<Backend>().unwrap(), Backend::Ct2);
+        assert_eq!("google".parse::<Backend>().unwrap(), Backend::Google);
         assert!("wat".parse::<Backend>().is_err());
     }
 
     #[test]
-    fn detects_basic_spanish_for_native_path() {
-        assert_eq!(simple_detect_language("hola, vamos para BZ"), "es");
+    fn parses_source_language_config() {
+        assert_eq!(
+            "auto".parse::<SourceLanguageConfig>().unwrap(),
+            SourceLanguageConfig::Auto
+        );
+        assert_eq!(
+            "es".parse::<SourceLanguageConfig>().unwrap(),
+            SourceLanguageConfig::Manual("es".to_string())
+        );
+        assert!("fr".parse::<SourceLanguageConfig>().is_err());
     }
 }

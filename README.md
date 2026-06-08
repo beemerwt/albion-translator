@@ -51,6 +51,7 @@ Backend selection:
 TRANSLATION_BACKEND=auto cargo run
 TRANSLATION_BACKEND=ct2 cargo run
 TRANSLATION_BACKEND=argos cargo run
+TRANSLATION_BACKEND=google cargo run
 TRANSLATION_BACKEND=noop cargo run
 ```
 
@@ -60,6 +61,48 @@ available, it falls back to the deprecated Argos sidecar unless disabled:
 ```sh
 ALBION_TRANSLATOR_ARGOS_FALLBACK=0 cargo run
 ```
+
+Source-language routing:
+
+```sh
+TRANSLATION_SOURCE_LANG=auto cargo run
+TRANSLATION_SOURCE_LANG=es cargo run
+TRANSLATION_SOURCE_LANG=pt cargo run
+TRANSLATION_TARGET_LANG=en cargo run
+TRANSLATION_DETECTION_CONFIDENCE_THRESHOLD=0.65 cargo run
+```
+
+`auto` detects one source language locally with `lingua`, then routes only to
+the matching installed `source -> target` model. Low-confidence detections,
+very short messages, URLs, number-only text, emoji/punctuation-only text, and
+already-target-language messages are skipped without warning spam. Manual source
+values are useful for debugging and bypass automatic detection.
+
+Google Translate is available as a remote backend:
+
+```sh
+cp .env.example .env
+TRANSLATION_BACKEND=google cargo run
+```
+
+Fill in `GOOGLE_TRANSLATE_API_KEY` in `.env`. The app loads `.env` at startup
+with `dotenvy`, and shell environment variables still take precedence.
+`TRANSLATION_GOOGLE_API_KEY` is also accepted. Google Translate always uses
+Google's own source-language auto-detection; local `lingua` detection is only
+used for skip/routing decisions and as a fallback if Google omits a detected
+source language.
+
+Translated chat output includes the detected source language:
+
+```text
+[4:32 PM][Say][es] PlayerName: hello
+```
+
+Google translations are cached in SQLite before any backend is queried. The
+default database is `./translations.sqlite3`; override it with
+`TRANSLATION_CACHE_DB=/path/to/translations.sqlite3`. Cache keys use trimmed
+text with repeated whitespace collapsed, plus target language. Only Google
+results are inserted into the SQLite cache for now.
 
 Runtime device selection for ct2:
 

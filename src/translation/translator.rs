@@ -1,3 +1,4 @@
+use crate::translation::router::normalized_cache_text;
 use anyhow::{Result, anyhow};
 use std::{
     collections::{HashMap, VecDeque},
@@ -18,6 +19,8 @@ pub struct TranslateResponse {
     pub engine: String,
     pub model_id: Option<String>,
     pub device: String,
+    pub detected_language: Option<String>,
+    pub from_cache: bool,
 }
 
 pub trait Translator: Send + Sync {
@@ -37,7 +40,7 @@ impl CacheKey {
         Self {
             source_lang: request.source_lang.clone(),
             target_lang: request.target_lang.clone(),
-            text: request.text.clone(),
+            text: normalized_cache_text(&request.text),
             model_id,
         }
     }
@@ -139,6 +142,8 @@ impl Translator for NoopTranslator {
             engine: "noop".to_string(),
             model_id: None,
             device: "none".to_string(),
+            detected_language: Some(request.source_lang),
+            from_cache: false,
         })
     }
 }
@@ -165,6 +170,8 @@ mod tests {
                 engine: "test".to_string(),
                 model_id: self.model_id.clone(),
                 device: "cpu".to_string(),
+                detected_language: Some(request.source_lang),
+                from_cache: false,
             })
         }
     }
@@ -183,6 +190,27 @@ mod tests {
         let second = CacheKey::new(&request("hola"), Some("model-b".to_string()));
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn cache_key_normalizes_whitespace() {
+        let first = CacheKey::new(&request(" hola   Ava "), Some("model-a".to_string()));
+        let second = CacheKey::new(&request("hola Ava"), Some("model-a".to_string()));
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cache_key_includes_source_language() {
+        let mut first_request = request("hola");
+        first_request.source_lang = "es".to_string();
+        let mut second_request = request("hola");
+        second_request.source_lang = "pt".to_string();
+
+        assert_ne!(
+            CacheKey::new(&first_request, Some("model-a".to_string())),
+            CacheKey::new(&second_request, Some("model-a".to_string()))
+        );
     }
 
     #[test]

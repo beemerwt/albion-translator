@@ -29,6 +29,8 @@ const MIN_TRANSLATION_MAX_CHARS: usize = 120;
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+
     let args = Args::parse();
 
     let host_filter = HostFilter::from_file(Path::new(HOSTS_PATH))
@@ -59,7 +61,7 @@ fn run_capture(
         CAPTURE_FILTER
     );
 
-    let config = PhotonParserConfig::with_defaults("live".to_string(), args.debug);
+    let config = PhotonParserConfig::with_defaults("live".to_string(), false);
     let mut parser = PhotonParser::new(config);
     let mut packet_number = 0usize;
 
@@ -260,10 +262,6 @@ fn handle_packet(
         .ok();
 
     for decoded in &parser.decoded_packets()[before..] {
-        if args.debug {
-            debug_output_packet(decoded)?;
-        }
-
         let DecodedPacket::Event(event) = decoded else {
             continue; // Skip non-event packets when --all is specified
         };
@@ -272,17 +270,20 @@ fn handle_packet(
             Some(ExtractedPacket::ChatMessage(message)) => {
                 // Detect the language of the message and output the translated
                 // if the language was detected as English, just output the message
-                let output = match translator_server {
+                let translation = match translator_server {
                     Some(translator_server) => translate_chat_message(translator_server, message),
-                    None => Cow::Borrowed(message.message.as_str()),
+                    None => ChatTranslation::original(message.message.as_str(), "unknown"),
                 };
 
                 println!(
-                    "[{}][{}] {}: {}",
-                    millis_to_time_ampm(message.timestamp),
-                    message.channel_type,
-                    message.player_name,
-                    output
+                    "{}",
+                    format_chat_line(
+                        millis_to_time_ampm(message.timestamp),
+                        &message.channel_type.to_string(),
+                        &translation.detected_language,
+                        &message.player_name,
+                        &translation.output,
+                    )
                 );
                 // print_json(&value, args.pretty)?;
             }
@@ -294,52 +295,81 @@ fn handle_packet(
     Ok(())
 }
 
+struct ChatTranslation<'a> {
+    output: Cow<'a, str>,
+    detected_language: String,
+}
+
+impl<'a> ChatTranslation<'a> {
+    fn original(message: &'a str, detected_language: impl Into<String>) -> Self {
+        Self {
+            output: Cow::Borrowed(message),
+            detected_language: detected_language.into(),
+        }
+    }
+}
+
 fn translate_chat_message<'a>(
     translator_server: &translator::TranslatorServer,
     message: &'a ChatMessage,
-) -> Cow<'a, str> {
+) -> ChatTranslation<'a> {
     // Cleanse message to not include symbols that might cause translation to fail
     let clean_message = clean_message(&message.message);
 
-    match translator_server.detect_language(clean_message.as_str()) {
-        Ok(detected) if detected.language == "en" || detected.language == "unknown" => {
-            Cow::Borrowed(message.message.as_str())
+    match translator_server.translate_to_english(clean_message.as_str()) {
+        Ok(translated) if translated.engine == "skipped" => {
+            ChatTranslation::original(message.message.as_str(), display_language(&translated))
         }
-        Ok(detected) => {
-            match translator_server.translate_to_english_from(clean_message.as_str(), &detected.language)
-            {
-                Ok(translated)
-                    if is_usable_translation(clean_message.as_str(), &translated.translated_text) =>
-                {
-                    Cow::Owned(translated.translated_text)
-                }
-                Ok(translated) => {
-                    eprintln!(
-                        "warning: rejected suspicious {} translation from {} ({} chars -> {} chars)",
-                        detected.language,
-                        message.player_name,
-                        message.message.chars().count(),
-                        translated.translated_text.chars().count()
-                    );
-                    Cow::Borrowed(message.message.as_str())
-                }
-                Err(error) => {
-                    eprintln!(
-                        "warning: failed to translate {} chat message from {}: {error}",
-                        detected.language, message.player_name
-                    );
-                    Cow::Borrowed(message.message.as_str())
-                }
+        Ok(translated)
+            if is_usable_translation(clean_message.as_str(), &translated.translated_text) =>
+        {
+            ChatTranslation {
+                detected_language: display_language(&translated),
+                output: Cow::Owned(translated.translated_text),
             }
+        }
+        Ok(translated) => {
+            eprintln!(
+                "warning: rejected suspicious {} translation from {} ({} chars -> {} chars)",
+                translated.source,
+                message.player_name,
+                message.message.chars().count(),
+                translated.translated_text.chars().count()
+            );
+            ChatTranslation::original(message.message.as_str(), display_language(&translated))
         }
         Err(error) => {
             eprintln!(
-                "warning: failed to detect chat message language from {}: {error}",
+                "warning: failed to translate chat message from {}: {error}",
                 message.player_name
             );
-            Cow::Borrowed(message.message.as_str())
+            ChatTranslation::original(message.message.as_str(), "unknown")
         }
     }
+}
+
+fn display_language(response: &translator::TranslateResponse) -> String {
+    response
+        .detected_language
+        .clone()
+        .filter(|language| !language.trim().is_empty())
+        .unwrap_or_else(|| {
+            if response.source.trim().is_empty() {
+                "unknown".to_string()
+            } else {
+                response.source.clone()
+            }
+        })
+}
+
+fn format_chat_line(
+    time: String,
+    channel: &str,
+    language: &str,
+    player_name: &str,
+    output: &str,
+) -> String {
+    format!("[{time}][{channel}][{language}] {player_name}: {output}")
 }
 
 fn is_usable_translation(original: &str, translated: &str) -> bool {
@@ -375,13 +405,27 @@ fn print_json(value: &Value, pretty: bool) -> Result<()> {
 }
 
 fn clean_message(message: &str) -> String {
-    // keep only a-zA-Z0-9, spaces, exclamation marks, question marks, periods, commas, and apostrophes
     message
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || c.is_ascii_whitespace() || *c == '!' || *c == '?')
-        .collect()
+        .map(|character| {
+            if character.is_control() || is_removed_chat_wrapper(character) {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
+fn is_removed_chat_wrapper(character: char) -> bool {
+    matches!(
+        character,
+        '[' | ']' | '<' | '>' | '{' | '}' | '|' | '`' | '~' | '^'
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -402,5 +446,34 @@ mod tests {
         let translated = "mainstream".repeat(80);
 
         assert!(!is_usable_translation("mainstream", &translated));
+    }
+
+    #[test]
+    fn clean_message_preserves_portuguese_letters() {
+        assert_eq!(clean_message("não você está aí?"), "não você está aí?");
+    }
+
+    #[test]
+    fn clean_message_removes_wrappers_without_dropping_text() {
+        assert_eq!(
+            clean_message("[não] <você> {fame}|gank"),
+            "não você fame gank"
+        );
+    }
+
+    #[test]
+    fn clean_message_keeps_common_chat_punctuation() {
+        assert_eq!(
+            clean_message("olá, Ava! vamos: RZ/IP - spec."),
+            "olá, Ava! vamos: RZ/IP - spec."
+        );
+    }
+
+    #[test]
+    fn formats_chat_line_with_detected_language() {
+        assert_eq!(
+            format_chat_line("4:32 PM".to_string(), "Say", "es", "PlayerName", "hello"),
+            "[4:32 PM][Say][es] PlayerName: hello"
+        );
     }
 }

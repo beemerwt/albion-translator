@@ -3,7 +3,7 @@ set -euo pipefail
 
 export RUST_LOG=1
 export ALBION_NETWORK_DEBUG=1
-export TRANSLATION_MODEL_DIR=./models-cache
+export TRANSLATION_BACKEND=google
 
 cargo build
 sudo setcap cap_net_raw,cap_net_admin+ep ./target/debug/albion-translator
