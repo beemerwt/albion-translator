@@ -1,0 +1,22 @@
+{
+  "name": "translategemma-vllm",
+  "endpoint": "http://localhost:8000/v1/completions",
+  "method": "POST",
+  "headers": {
+    "Authorization": "Bearer {api_key}",
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "model": "Infomaniak-AI/vllm-translategemma-4b-it",
+    "prompt": "<<<source>>>{src_lang}<<<target>>>{target_lang}<<<text>>>{text}<<</text>>>",
+    "max_tokens": 128,
+    "temperature": 0,
+    "stop": ["<<<source>>>", "<<<target>>>", "<<</text>>>"]
+  },
+  "response": {
+    "text_path": "$.choices[0].text",
+    "trim": true,
+    "strip_prefixes": ["."],
+    "truncate_before": ["<<<source>>>", "<<<target>>>", "<<</text>>>"]
+  }
+}

@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod ct2;
 pub mod glossary;
+pub mod http_template;
 pub mod language_detector;
 pub mod model_store;
 pub mod router;
@@ -12,6 +13,7 @@ use std::{env, path::PathBuf, str::FromStr};
 pub use cache::{CachedTranslation, TranslationCache};
 pub use ct2::{Ct2Config, Ct2Translator};
 pub use glossary::Glossary;
+pub use http_template::{HttpTemplateBackend, HttpTemplateConfig};
 pub use language_detector::{
     LanguageDetection, LanguageDetector, LinguaLanguageDetector, ManualLanguageDetector,
     NoopLanguageDetector,
@@ -31,6 +33,8 @@ pub enum Backend {
     Ct2,
     Argos,
     Google,
+    Http,
+    TranslateGemmaVllm,
     Noop,
 }
 
@@ -41,6 +45,8 @@ impl Backend {
             Self::Ct2 => "ct2",
             Self::Argos => "argos",
             Self::Google => "google",
+            Self::Http => "http",
+            Self::TranslateGemmaVllm => "translategemma-vllm",
             Self::Noop => "noop",
         }
     }
@@ -55,9 +61,13 @@ impl FromStr for Backend {
             "ct2" | "ctranslate2" => Ok(Self::Ct2),
             "argos" => Ok(Self::Argos),
             "google" | "google-translate" | "google_translate" => Ok(Self::Google),
+            "http" | "custom-http" | "model-http" | "http-template" => Ok(Self::Http),
+            "translategemma-vllm" | "translate-gemma-vllm" | "translategemma_vllm" => {
+                Ok(Self::TranslateGemmaVllm)
+            }
             "noop" | "none" => Ok(Self::Noop),
             other => Err(anyhow!(
-                "unsupported translation backend {other:?}; expected auto, ct2, argos, google, or noop"
+                "unsupported translation backend {other:?}; expected auto, ct2, argos, google, http, translategemma-vllm, or noop"
             )),
         }
     }
@@ -108,6 +118,8 @@ pub struct TranslationConfig {
     pub cache_capacity: usize,
     pub cache_db_path: PathBuf,
     pub argos_fallback: bool,
+    pub http_config_path: Option<PathBuf>,
+    pub http_api_key: Option<String>,
 }
 
 impl Default for TranslationConfig {
@@ -124,6 +136,8 @@ impl Default for TranslationConfig {
             cache_capacity: 256,
             cache_db_path: PathBuf::from("translations.sqlite3"),
             argos_fallback: true,
+            http_config_path: None,
+            http_api_key: None,
         }
     }
 }
@@ -195,6 +209,18 @@ impl TranslationConfig {
             config.argos_fallback = parse_bool(&value)?;
         }
 
+        if let Some(value) = read_env("TRANSLATION_HTTP_CONFIG")? {
+            config.http_config_path = Some(PathBuf::from(value));
+        } else if let Some(value) = read_env("ALBION_TRANSLATION_HTTP_CONFIG")? {
+            config.http_config_path = Some(PathBuf::from(value));
+        }
+
+        if let Some(value) = read_env("TRANSLATION_HTTP_API_KEY")? {
+            config.http_api_key = Some(value);
+        } else if let Some(value) = read_env("ALBION_TRANSLATION_HTTP_API_KEY")? {
+            config.http_api_key = Some(value);
+        }
+
         Ok(config)
     }
 }
@@ -237,6 +263,11 @@ mod tests {
         assert_eq!("ct2".parse::<Backend>().unwrap(), Backend::Ct2);
         assert_eq!("ctranslate2".parse::<Backend>().unwrap(), Backend::Ct2);
         assert_eq!("google".parse::<Backend>().unwrap(), Backend::Google);
+        assert_eq!("http".parse::<Backend>().unwrap(), Backend::Http);
+        assert_eq!(
+            "translategemma-vllm".parse::<Backend>().unwrap(),
+            Backend::TranslateGemmaVllm
+        );
         assert!("wat".parse::<Backend>().is_err());
     }
 

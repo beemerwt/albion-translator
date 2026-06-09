@@ -1,7 +1,11 @@
 use crate::translation::{
-    Backend, Ct2Config, LanguageDetection, LanguageDetector, LinguaLanguageDetector,
-    SourceLanguageConfig, TranslationCache, TranslationConfig, TranslationOutcome,
-    TranslationRouter,
+    Backend, Ct2Config, HttpTemplateBackend, HttpTemplateConfig, LanguageDetection,
+    LanguageDetector, LinguaLanguageDetector, SourceLanguageConfig, TranslationCache,
+    TranslationConfig, TranslationOutcome, TranslationRouter,
+    translator::{
+        TranslateRequest as BackendTranslateRequest, TranslateResponse as BackendTranslateResponse,
+        Translator,
+    },
 };
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
@@ -62,6 +66,10 @@ impl TranslatorServer {
     pub fn detect_language(&self, text: &str) -> Result<DetectResponse> {
         self.backend.detect_language(text)
     }
+
+    pub fn uses_async_remote_backend(&self) -> bool {
+        self.backend.uses_async_remote_backend()
+    }
 }
 
 enum TranslationBackend {
@@ -74,6 +82,13 @@ enum TranslationBackend {
     Google {
         client: GoogleTranslateClient,
         detector: LinguaLanguageDetector,
+        target_lang: String,
+        confidence_threshold: f64,
+    },
+    Http {
+        client: HttpTemplateBackend,
+        detector: LinguaLanguageDetector,
+        source_lang: SourceLanguageConfig,
         target_lang: String,
         confidence_threshold: f64,
     },
@@ -113,6 +128,31 @@ impl TranslationBackend {
             Backend::Google => Ok(Self::Google {
                 client: GoogleTranslateClient::from_env()?,
                 detector: LinguaLanguageDetector::default(),
+                target_lang: config.target_lang,
+                confidence_threshold: config.detection_confidence_threshold,
+            }),
+            Backend::Http => {
+                let path = config.http_config_path.clone().ok_or_else(|| {
+                    anyhow!("TRANSLATION_BACKEND=http requires TRANSLATION_HTTP_CONFIG")
+                })?;
+                Ok(Self::Http {
+                    client: HttpTemplateBackend::from_path(path, config.http_api_key.clone())?,
+                    detector: LinguaLanguageDetector::default(),
+                    source_lang: config.source_lang,
+                    target_lang: config.target_lang,
+                    confidence_threshold: config.detection_confidence_threshold,
+                })
+            }
+            Backend::TranslateGemmaVllm => Ok(Self::Http {
+                client: HttpTemplateBackend::new(
+                    match config.http_config_path.clone() {
+                        Some(path) => HttpTemplateConfig::from_path(path)?,
+                        None => HttpTemplateConfig::translategemma_vllm_preset()?,
+                    },
+                    config.http_api_key.clone(),
+                )?,
+                detector: LinguaLanguageDetector::default(),
+                source_lang: config.source_lang,
                 target_lang: config.target_lang,
                 confidence_threshold: config.detection_confidence_threshold,
             }),
@@ -158,12 +198,18 @@ impl TranslationBackend {
     fn wait_for_health(&mut self) -> Result<()> {
         match self {
             Self::Argos { server, .. } => server.wait_for_health(),
-            Self::Native(_) | Self::Google { .. } | Self::Noop { .. } | Self::Unavailable(_) => {
-                Ok(())
-            }
+            Self::Native(_)
+            | Self::Google { .. }
+            | Self::Http { .. }
+            | Self::Noop { .. }
+            | Self::Unavailable(_) => Ok(()),
             #[cfg(test)]
             Self::Counting { .. } => Ok(()),
         }
+    }
+
+    fn uses_async_remote_backend(&self) -> bool {
+        matches!(self, Self::Google { .. } | Self::Http { .. })
     }
 
     fn translate_to_english_from(&self, text: &str, source: &str) -> Result<TranslateResponse> {
@@ -233,6 +279,34 @@ impl TranslationBackend {
                 apply_google_language_fallback(&mut response, local_detected_language);
                 Ok(response)
             }
+            Self::Http {
+                client,
+                detector,
+                source_lang,
+                target_lang,
+                confidence_threshold,
+            } => {
+                let source = resolve_http_source(detector, source_lang, text, source)?;
+                if let Some(response) = skip_from_local_detection(
+                    text,
+                    target_lang,
+                    confidence_threshold,
+                    Some(&source),
+                ) {
+                    return Ok(response);
+                }
+
+                let response = client.translate(BackendTranslateRequest {
+                    source_lang: source.language.clone(),
+                    target_lang: target_lang.clone(),
+                    text: text.to_string(),
+                })?;
+                Ok(http_translate_response(
+                    response,
+                    source.language,
+                    target_lang.clone(),
+                ))
+            }
             Self::Noop {
                 source_lang,
                 target_lang,
@@ -259,6 +333,7 @@ impl TranslationBackend {
         match self {
             Self::Native(router) => detect_response(router.detect_language(text)?),
             Self::Google { detector, .. } => detect_response(detector.detect(text)?),
+            Self::Http { detector, .. } => detect_response(detector.detect(text)?),
             Self::Noop { .. } | Self::Unavailable(_) => {
                 detect_response(LinguaLanguageDetector::default().detect(text)?)
             }
@@ -268,6 +343,47 @@ impl TranslationBackend {
             }
             Self::Argos { server, .. } => server.client.detect_language(text),
         }
+    }
+}
+
+fn resolve_http_source(
+    detector: &LinguaLanguageDetector,
+    config_source: &SourceLanguageConfig,
+    text: &str,
+    source: &str,
+) -> Result<LanguageDetection> {
+    if source != "auto" {
+        return Ok(LanguageDetection {
+            language: source.to_string(),
+            confidence: Some(1.0),
+            reliable: true,
+        });
+    }
+
+    match config_source {
+        SourceLanguageConfig::Manual(language) => Ok(LanguageDetection {
+            language: language.clone(),
+            confidence: Some(1.0),
+            reliable: true,
+        }),
+        SourceLanguageConfig::Auto => detector.detect(text),
+    }
+}
+
+fn http_translate_response(
+    response: BackendTranslateResponse,
+    source: String,
+    target: String,
+) -> TranslateResponse {
+    TranslateResponse {
+        source,
+        target,
+        translated_text: response.translated_text,
+        engine: response.engine,
+        model_id: response.model_id,
+        device: response.device,
+        detected_language: response.detected_language,
+        from_cache: response.from_cache,
     }
 }
 

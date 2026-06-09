@@ -14,10 +14,14 @@ use pcap::{Active, Capture, Device};
 use serde_json::Value;
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     io, mem,
     path::Path,
     ptr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, mpsc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -39,20 +43,23 @@ fn main() -> Result<()> {
     let translator_server = if args.dry_run {
         None
     } else {
-        Some(translator::TranslatorServer::start().context("failed to start translator sidecar")?)
+        Some(Arc::new(
+            translator::TranslatorServer::start().context("failed to start translator sidecar")?,
+        ))
     };
 
-    run_capture(&host_filter, &args, translator_server.as_ref())
+    run_capture(&host_filter, &args, translator_server)
 }
 
 fn run_capture(
     host_filter: &HostFilter,
     args: &Args,
-    translator_server: Option<&translator::TranslatorServer>,
+    translator_server: Option<Arc<translator::TranslatorServer>>,
 ) -> Result<()> {
     install_shutdown_handlers().context("failed to install shutdown signal handlers")?;
 
     let mut captures = open_captures()?;
+    let mut chat_output = ChatOutputPipeline::new(translator_server);
 
     let mode = if args.dry_run { "dry run; " } else { "" };
     eprintln!(
@@ -85,9 +92,10 @@ fn run_capture(
                         source.link_type,
                         host_filter,
                         args,
-                        translator_server,
+                        &mut chat_output,
                     )
                     .with_context(|| format!("capture source {}", source.name))?;
+                    chat_output.print_ready();
                 }
                 Err(pcap::Error::NoMorePackets | pcap::Error::TimeoutExpired) => {}
                 Err(error) => {
@@ -97,10 +105,12 @@ fn run_capture(
         }
 
         if !received_packet {
+            chat_output.print_ready();
             thread::sleep(Duration::from_millis(10));
         }
     }
 
+    chat_output.finish();
     eprintln!("stopped after {packet_number} packets");
     Ok(())
 }
@@ -240,8 +250,8 @@ fn handle_packet(
     frame: &[u8],
     link_type: u16,
     host_filter: &HostFilter,
-    args: &Args,
-    translator_server: Option<&translator::TranslatorServer>,
+    _args: &Args,
+    chat_output: &mut ChatOutputPipeline,
 ) -> Result<()> {
     let Some(packet) = extract_udp_payload(frame, Some(link_type)) else {
         return Ok(());
@@ -268,23 +278,7 @@ fn handle_packet(
 
         match &event.extracted {
             Some(ExtractedPacket::ChatMessage(message)) => {
-                // Detect the language of the message and output the translated
-                // if the language was detected as English, just output the message
-                let translation = match translator_server {
-                    Some(translator_server) => translate_chat_message(translator_server, message),
-                    None => ChatTranslation::original(message.message.as_str(), "unknown"),
-                };
-
-                println!(
-                    "{}",
-                    format_chat_line(
-                        millis_to_time_ampm(message.timestamp),
-                        &message.channel_type.to_string(),
-                        &translation.detected_language,
-                        &message.player_name,
-                        &translation.output,
-                    )
-                );
+                chat_output.submit(message);
                 // print_json(&value, args.pretty)?;
             }
             Some(_) => continue,
@@ -293,6 +287,132 @@ fn handle_packet(
     }
 
     Ok(())
+}
+
+struct ChatOutputPipeline {
+    translator_server: Option<Arc<translator::TranslatorServer>>,
+    async_remote: bool,
+    sender: mpsc::Sender<OrderedChatLine>,
+    receiver: mpsc::Receiver<OrderedChatLine>,
+    completed: BTreeMap<usize, String>,
+    next_sequence: usize,
+    next_to_print: usize,
+}
+
+impl ChatOutputPipeline {
+    fn new(translator_server: Option<Arc<translator::TranslatorServer>>) -> Self {
+        let async_remote = translator_server
+            .as_ref()
+            .is_some_and(|server| server.uses_async_remote_backend());
+        let (sender, receiver) = mpsc::channel();
+
+        Self {
+            translator_server,
+            async_remote,
+            sender,
+            receiver,
+            completed: BTreeMap::new(),
+            next_sequence: 0,
+            next_to_print: 0,
+        }
+    }
+
+    fn submit(&mut self, message: &ChatMessage) {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+
+        if self.async_remote {
+            let pending = PendingChatMessage::from(message);
+            let sender = self.sender.clone();
+            let translator_server = self
+                .translator_server
+                .as_ref()
+                .expect("async translation requires a translator server")
+                .clone();
+
+            thread::spawn(move || {
+                let line = format_pending_chat_line(Some(translator_server.as_ref()), &pending);
+                let _ = sender.send(OrderedChatLine { sequence, line });
+            });
+        } else {
+            let pending = PendingChatMessage::from(message);
+            let line = format_pending_chat_line(self.translator_server.as_deref(), &pending);
+            self.completed.insert(sequence, line);
+            self.print_ready();
+        }
+    }
+
+    fn print_ready(&mut self) {
+        while let Ok(completed) = self.receiver.try_recv() {
+            self.completed.insert(completed.sequence, completed.line);
+        }
+
+        while let Some(line) = self.completed.remove(&self.next_to_print) {
+            println!("{line}");
+            self.next_to_print += 1;
+        }
+    }
+
+    fn finish(&mut self) {
+        while self.next_to_print < self.next_sequence {
+            self.print_ready();
+            if self.next_to_print >= self.next_sequence {
+                break;
+            }
+
+            match self.receiver.recv() {
+                Ok(completed) => {
+                    self.completed.insert(completed.sequence, completed.line);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+struct OrderedChatLine {
+    sequence: usize,
+    line: String,
+}
+
+struct PendingChatMessage {
+    timestamp: i64,
+    channel: String,
+    player_name: String,
+    message: String,
+}
+
+impl From<&ChatMessage> for PendingChatMessage {
+    fn from(message: &ChatMessage) -> Self {
+        Self {
+            timestamp: message.timestamp,
+            channel: message.channel_type.to_string(),
+            player_name: message.player_name.clone(),
+            message: message.message.clone(),
+        }
+    }
+}
+
+fn format_pending_chat_line(
+    translator_server: Option<&translator::TranslatorServer>,
+    message: &PendingChatMessage,
+) -> String {
+    let translation = match translator_server {
+        Some(translator_server) => translate_chat_message(
+            translator_server,
+            message.message.as_str(),
+            message.player_name.as_str(),
+        ),
+        None => ChatTranslation::original(message.message.as_str(), "unknown"),
+    };
+
+    format_chat_line(
+        millis_to_time_ampm(message.timestamp),
+        &message.channel,
+        &translation.detected_language,
+        &message.player_name,
+        &translation.output,
+    )
 }
 
 struct ChatTranslation<'a> {
@@ -311,39 +431,28 @@ impl<'a> ChatTranslation<'a> {
 
 fn translate_chat_message<'a>(
     translator_server: &translator::TranslatorServer,
-    message: &'a ChatMessage,
+    message: &'a str,
+    player_name: &str,
 ) -> ChatTranslation<'a> {
     // Cleanse message to not include symbols that might cause translation to fail
-    let clean_message = clean_message(&message.message);
+    let clean_message = clean_message(message);
 
     match translator_server.translate_to_english(clean_message.as_str()) {
         Ok(translated) if translated.engine == "skipped" => {
-            ChatTranslation::original(message.message.as_str(), display_language(&translated))
+            ChatTranslation::original(message, display_language(&translated))
         }
-        Ok(translated)
-            if is_usable_translation(clean_message.as_str(), &translated.translated_text) =>
-        {
+        Ok(translated) => {
             ChatTranslation {
                 detected_language: display_language(&translated),
                 output: Cow::Owned(translated.translated_text),
             }
         }
-        Ok(translated) => {
-            eprintln!(
-                "warning: rejected suspicious {} translation from {} ({} chars -> {} chars)",
-                translated.source,
-                message.player_name,
-                message.message.chars().count(),
-                translated.translated_text.chars().count()
-            );
-            ChatTranslation::original(message.message.as_str(), display_language(&translated))
-        }
         Err(error) => {
             eprintln!(
                 "warning: failed to translate chat message from {}: {error}",
-                message.player_name
+                player_name
             );
-            ChatTranslation::original(message.message.as_str(), "unknown")
+            ChatTranslation::original(message, "unknown")
         }
     }
 }

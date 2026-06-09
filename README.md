@@ -52,6 +52,8 @@ TRANSLATION_BACKEND=auto cargo run
 TRANSLATION_BACKEND=ct2 cargo run
 TRANSLATION_BACKEND=argos cargo run
 TRANSLATION_BACKEND=google cargo run
+TRANSLATION_BACKEND=http TRANSLATION_HTTP_CONFIG=presets/translategemma-vllm.json cargo run
+TRANSLATION_BACKEND=translategemma-vllm cargo run
 TRANSLATION_BACKEND=noop cargo run
 ```
 
@@ -91,6 +93,37 @@ with `dotenvy`, and shell environment variables still take precedence.
 Google's own source-language auto-detection; local `lingua` detection is only
 used for skip/routing decisions and as a fallback if Google omits a detected
 source language.
+
+Custom HTTP translation backends are configured with JSON templates:
+
+```sh
+TRANSLATION_BACKEND=http \
+TRANSLATION_HTTP_CONFIG=presets/translategemma-vllm.json \
+cargo run
+```
+
+The built-in TranslateGemma vLLM preset can also be selected directly:
+
+```sh
+TRANSLATION_BACKEND=translategemma-vllm cargo run
+```
+
+The preset targets a local vLLM OpenAI-compatible completions server at
+`http://localhost:8000/v1/completions`, model
+`Infomaniak-AI/vllm-translategemma-4b-it`, and this prompt format:
+
+```text
+<<<source>>>{src_lang}<<<target>>>{target_lang}<<<text>>>{text}<<</text>>>
+```
+
+HTTP template config files support `endpoint`, `method`, interpolated
+`headers`, interpolated JSON `body`, response extraction with paths such as
+`$.choices[0].text`, `$.choices[0].message.content`, `$.response`, and
+`$.translated_text`, plus output cleanup rules. Available placeholders are
+`{text}`, `{src_lang}`, `{target_lang}`, and optional `{api_key}`. Set
+`TRANSLATION_HTTP_API_KEY` when a header such as `Authorization: Bearer
+{api_key}` is needed; headers containing `{api_key}` are omitted when no key is
+configured.
 
 Translated chat output includes the detected source language:
 
